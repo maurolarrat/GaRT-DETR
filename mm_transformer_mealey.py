@@ -47,9 +47,6 @@ class PointNetEncoder(nn.Module):
         # x agora é (B*T, D_feature, L_max)
         
         # Global Max Pooling (GMP): Cria o vetor de features fixo D_feature
-        # A GMP ignora os zeros de padding (se a máscara for aplicada corretamente)
-        # No entanto, a implementação padrão do GMP em PyTorch é robusta para zeros de padding.
-        # A maneira mais limpa de lidar com zeros é garantir que eles sejam o valor mínimo.
         
         # Máscara (opcional, mas recomendado)
         if padding_mask is not None:
@@ -61,16 +58,13 @@ class PointNetEncoder(nn.Module):
         # Max Pooling (redução da dimensão L_max)
         x = torch.max(x, 2)[0] # Resultado: (B*T, D_feature)
         
-        # x = self.final_mlp(x) # Se precisarmos de um MLP final (não usamos aqui, apenas na Proj_Modal)
-        
         return x # (B*T, D_feature)
 
 # =========================================================================
 # UTILITY: STOCHASTIC DEPTH (DropPath)
-# ... (Mantido inalterado)
+# -------------------------------------------------------------------------
 
 class DropPath(nn.Module):
-    # ... (Implementação omitida por concisão, é a mesma) ...
     """Implementação simplificada de Stochastic Depth (DropPath) para regularização."""
     def __init__(self, drop_prob=None):
         super(DropPath, self).__init__()
@@ -86,12 +80,10 @@ class DropPath(nn.Module):
 
 # =========================================================================
 # NEURAL MEALY CORE (Aprimorado)
-# ... (Mantido inalterado)
+# -------------------------------------------------------------------------
 class NeuralMealyLayer(nn.Module):
-    # ... (Implementação omitida por concisão, é a mesma) ...
     """
     Simula o core Neural-Mealy com regularização aprimorada para coerência temporal.
-    Introduz Dropout e Temperature Scaling para 'Soft Transitions'.
     """
     def __init__(self, hidden_dim, num_explainable_states, dropout_rate, temp_scale=1.0):
         super().__init__()
@@ -123,19 +115,19 @@ class NeuralMealyLayer(nn.Module):
 
 
 # =========================================================================
-# MULTIMODAL TRANSFORMER (AJUSTADO)
+# MULTIMODAL TRANSFORMER (CORRIGIDO PARA PREDICAO TEMPORAL)
 # -------------------------------------------------------------------------
 
 class MultiModalTransformer(nn.Module):
     """
     Modelo Multimodal baseado em Transformer.
     Ajustado para lidar com PCLs (B, T, L_max, D_point) via PointNet.
+    Corrigido para prever a posição em tempo real, em cada passo Mealy.
     """
     def __init__(self, config=CONFIG, pos_mean=None, pos_std=None):
         super().__init__()
         
         hidden_dim = config['transformer_hidden_dim']
-        # feature_dim agora é a saída do PointNet (PointNet_feature_dim)
         pointnet_feature_dim = CONFIG['modal_feature_dim'] 
         point_dim = CONFIG['pcl_feature_dim']
         dropout_rate = CONFIG.get('dropout_rate', 0.2)
@@ -156,7 +148,6 @@ class MultiModalTransformer(nn.Module):
         # --- Projeções para Hidden Dim ---
         
         self.proj_visual = nn.Linear(self.visual_dim, hidden_dim)
-        # O PointNet já gera features, então proj_modal mapeia PointNet_feature_dim -> hidden_dim
         self.proj_modal = nn.Linear(pointnet_feature_dim, hidden_dim) 
         
         # Fusion token
@@ -184,7 +175,7 @@ class MultiModalTransformer(nn.Module):
             temp_scale=config.get('mealy_temp_scale', 0.5)
         )
         
-        # Head de posição com inicialização adaptada (mantido inalterado)
+        # Head de posição (Predicts 3D position from the Mealy state)
         self.pos_head = nn.Sequential(
             nn.Linear(hidden_dim, 1024),
             nn.GELU(),
@@ -197,9 +188,16 @@ class MultiModalTransformer(nn.Module):
         self._init_pos_head()
 
     def _init_pos_head(self):
+        """Inicializa o Pos Head com pesos menores para evitar explosão inicial."""
+        # Novo valor de ganho, reduzido para 0.01 (ou até 0.001 se necessário)
+        XAVIER_GAIN = 0.01 
+        
+        # Itera sobre os módulos para aplicar a inicialização
         for m in self.pos_head:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                # Inicializa os pesos com ganho reduzido
+                nn.init.xavier_uniform_(m.weight, gain=XAVIER_GAIN)
+                # Garante que o bias seja zero
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
@@ -238,7 +236,6 @@ class MultiModalTransformer(nn.Module):
         F_V = F_V_flat.view(B, T, -1) # (B, T, hidden_dim)
         
         # 2. Processamento de PCLs: (B, T, L_max, D_point) -> (B, T, D_feature) -> (B, T, hidden_dim)
-        # Note que a função _process_pcl é capaz de lidar com L_max variável (padding)
         F_L360_raw = self._process_pcl(lidar_360, B, T)
         F_LA_raw = self._process_pcl(livox_avia, B, T)
         F_R_raw = self._process_pcl(radar, B, T)
@@ -249,13 +246,11 @@ class MultiModalTransformer(nn.Module):
         F_R = self.proj_modal(F_R_raw)
         
         # 3. Criação da Sequência Multimodal
-        # Sequence é (B, T, 4 * hidden_dim) - NÃO, precisamos que o Transformer processe a sequência de features.
         
         # Concatenamos as features modais: (B, T, N_modals, hidden_dim)
         modal_features = torch.stack((F_V, F_L360, F_LA, F_R), dim=2) # (B, T, 4, hidden_dim)
 
         # Achata (B, T, N_modals, hidden_dim) para (B*T, N_modals, hidden_dim)
-        # O Transformer fará a fusão DENTRO de cada timestamp (T)
         input_sequence_transformer = modal_features.view(B*T, 4, -1)
         
         # 4. Inserção do Fusion Token e Processamento Transformer
@@ -276,68 +271,48 @@ class MultiModalTransformer(nn.Module):
         next_mealy_state = prev_mealy_state
         all_class_logits = []
         all_state_logits = []
-        
+        all_pos_predictions = []      # Denormalizada (em metros)
+        all_pos_norm_predictions = [] # NOVO: Normalizada (para cálculo de Loss)
+
         # Loop sequencial sobre T
         for t in range(T):
             current_embedding = F_Mealy_Input[t] # (B, hidden_dim)
             next_mealy_state, pred_class_logits, state_transition_logits = self.mealy_core(
                 current_embedding, next_mealy_state
             )
+            
+            # Predição de posição no domínio normalizado
+            pred_pos_norm_t = self.pos_head(next_mealy_state) # (B, 3) <--- NORMALIZED
+            all_pos_norm_predictions.append(pred_pos_norm_t.unsqueeze(0)) 
+
+            # Denormalização para métricas (exibir o erro em metros)
+            pred_pos_t = pred_pos_norm_t * self.pos_std.to(pred_pos_norm_t.device) + self.pos_mean.to(pred_pos_norm_t.device)
+            all_pos_predictions.append(pred_pos_t.unsqueeze(0)) 
+
             all_class_logits.append(pred_class_logits.unsqueeze(0))
             all_state_logits.append(state_transition_logits.unsqueeze(0))
 
-        # Reestrutura a saída para (B, T, D)
+        # Reestrutura as saídas sequenciais para (B, T, D)
         pred_class_logits_seq = torch.cat(all_class_logits, dim=0).transpose(0, 1) # (B, T, 1)
         state_transition_logits_seq = torch.cat(all_state_logits, dim=0).transpose(0, 1) # (B, T, NUM_SYMBOLIC_STATES)
+        pred_pos_seq = torch.cat(all_pos_predictions, dim=0).transpose(0, 1) # (B, T, 3)
+        pred_pos_norm_seq = torch.cat(all_pos_norm_predictions, dim=0).transpose(0, 1) # NOVO: (B, T, 3)
         
-        # Predição de posição usa o estado final da sequência (next_mealy_state)
-        # next_mealy_state agora é (B, hidden_dim) (o último estado)
-        pred_pos_norm = self.pos_head(next_mealy_state) # (B, 3)
-        pred_pos = pred_pos_norm * self.pos_std.to(pred_pos_norm.device) + self.pos_mean.to(pred_pos_norm.device)
-        
+        # Para compatibilidade com o script de treinamento externo (que usa T=1)
+        if T == 1:
+            final_pred_pos = pred_pos_seq.squeeze(1) # (B, 3)
+            final_pred_pos_norm = pred_pos_norm_seq.squeeze(1) # NOVO: (B, 3)
+        else:
+            final_pred_pos = pred_pos_seq
+            final_pred_pos_norm = pred_pos_norm_seq # NOVO: (B, T, 3)
+
         return {
-            # Posicao e Estado são a saída do ÚLTIMO passo de tempo (T-1)
-            'pred_pos': pred_pos, 
+            # Posicao em tempo real (Se T=1, é (B, 3); se T>1, é (B, T, 3))
+            'pred_pos': final_pred_pos,                   # Denormalizado
+            'pred_pos_norm': final_pred_pos_norm,         # NOVO: Normalizado (Usado para Loss no script de treino)
             # Logits de classe e transição são para TODOS os T passos
             'pred_class_seq': pred_class_logits_seq, 
             'mealy_state_logits_seq': state_transition_logits_seq,
             # Estado Mealy final para ser alimentado no próximo batch (se for o caso)
             'final_mealy_state': next_mealy_state 
         }
-    
-    '''
-    O que foi alterado e por quê?
-Novo Encoder de PCL (PointNetEncoder):
-
-Propósito: É o feature extractor que transforma a entrada padronizada de PCL (L_max, D_point) em um vetor de feature de tamanho fixo (D_feature). Isso é essencial, pois o Transformer só pode trabalhar com vetores de tamanho fixo.
-
-Integração: Adicionei self.pcl_encoder na inicialização do MultiModalTransformer.
-
-_process_pcl (Função Auxiliar):
-
-Propósito: Lida com a nova dimensão (B, T, L_max, D_point). Ele achata B e T para (B*T, L_max, D_point), passa pelo pcl_encoder e reestrutura para (B, T, D_feature).
-
-Processamento no forward:
-
-Entrada: O forward agora espera que todas as entradas tenham as dimensões de Batch e Sequência Temporal (B, T) na frente.
-
-Imagens: As imagens (B, T, C, H, W) são achatadas para (B*T, C, H, W) antes de passar pelo visual_backbone (ResNet), e reestruturadas para (B, T, hidden_dim) depois.
-
-PCLs: As PCLs (B, T, L_max, D_point) são processadas pela nova função _process_pcl e projetadas, resultando em (B, T, hidden_dim).
-
-Fusão Intratemporal (Transformer):
-
-A fusão é feita dentro de cada passo de tempo. O vetor de features multimodais (B, T, N_modals, hidden_dim) é achatado em (B*T, N_modals, hidden_dim). O Transformer faz a fusão e extrai o token final (B*T, hidden_dim).
-
-Processamento Temporal (Neural-Mealy):
-
-O resultado da fusão (B*T, hidden_dim) é reestruturado em (T, B, hidden_dim).
-
-O loop sequencial for t in range(T) passa a entrada pelo self.mealy_core (que usa nn.GRUCell), mantendo o estado next_mealy_state de forma correta ao longo do tempo.
-
-Saída da Posição:
-
-A predição de posição (pred_pos) e o estado final (final_mealy_state) são gerados apenas a partir do último estado (t=T-1) do GRU, pois é o estado que contém toda a informação da sequência.
-
-As saídas de classe e estado Mealy agora são retornadas como sequências completas (_seq) de tamanho (B, T, D).
-    '''
