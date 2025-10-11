@@ -1,303 +1,394 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm # Adicionado tqdm para o pre-carregamento do GT
 import os
 import numpy as np
 from PIL import Image
 from collections import defaultdict
 import math
-import pandas as pd 
 from typing import List, Tuple, Dict, Any
+import random
+from sklearn.model_selection import train_test_split 
+from torch.nn.utils.rnn import pad_sequence 
+from torch.utils.data.dataloader import default_collate
 
-# Configuração de Log: Mude para False para desligar as mensagens de Padding/Truncamento
+# --- NOVAS CONSTANTES PARA PCL FEATURE EXTRACTION ---
+PCL_POINT_DIM = 3 
+PCL_NUM_STATS = 3 
+DEFAULT_FEATURE_DIM = PCL_POINT_DIM * PCL_NUM_STATS
+MAX_POINTS_TO_PROCESS = 20000 
+# ----------------------------------------------------
+
+# Configuracao de Log: Mude para True para ver as mensagens de sincronizacao/fallback
 LOG_INCONSISTENCY = False 
 
-# Dimensão padrão para features NPY que o Transformer espera
-DEFAULT_FEATURE_DIM = 512 
+# Lista das subpastas/modalidades fixas dentro de 'Mavic3'
+MODALITIES = [
+    'ground_truth',
+    'image',
+    'lidar_360',
+    'livox_avia',
+    'radar_enhance_pcl'
+]
 
-class MMDataset(Dataset):
-    """
-    Custom PyTorch Dataset para carregar SEQUENCIAS de frames (chunks de tamanho T).
-    Implementa a logica de Ground Truth do estado simbolico (Mealy Transducer)
-    usando a latencia configurada.
+# Mapeamento do nome da pasta para a chave no dicionario de saida
+OUTPUT_KEY_MAP = {
+    'ground_truth': 'gt_pos', 
+    'image': 'image',
+    'lidar_360': 'lidar_360',
+    'livox_avia': 'livox_avia',
+    'radar_enhance_pcl': 'radar' 
+}
 
-    Estados Mealy:
-    - 0: Background
-    - 1: Candidate (Detected, mas não persistiu por L frames futuros)
-    - 2: Confirmed (Detected E persistiu por L frames futuros)
-    - -1: Absent/Ignore (GT de classe original é -1)
-    """
-    def __init__(self, split_file_path, data_root, config, phase='train'):
+# =========================================================================
+# CLASSE AUXILIAR DE NORMALIZAÇÃO DE POSIÇÃO
+# =========================================================================
+class PositionNormalizer:
+    """ Armazena e aplica as estatísticas de normalização do GT de Posição. """
+    def __init__(self, pos_data: np.ndarray = None):
+        if pos_data is not None:
+            # Calcular a media e std deviation sobre o conjunto de TREINO
+            self.mean = np.mean(pos_data, axis=0, keepdims=True)
+            self.std = np.std(pos_data, axis=0, keepdims=True)
+            # Evita divisão por zero
+            self.std[self.std == 0] = 1e-6 
+        else:
+            self.mean = None
+            self.std = None
+
+    def normalize(self, pos_tensor: torch.Tensor) -> torch.Tensor:
+        if self.mean is None or self.std is None:
+            return pos_tensor
+        
+        # Converte np.array para torch.Tensor para a operação
+        # Note que pos_tensor pode estar na GPU, o broadcast funciona se o normalizer estiver na CPU
+        mean_t = torch.from_numpy(self.mean).float() 
+        std_t = torch.from_numpy(self.std).float()
+
+        # Garante que o tensor GT e as estatísticas tenham as mesmas dimensões
+        return (pos_tensor - mean_t.to(pos_tensor.device)) / std_t.to(pos_tensor.device)
+
+    def denormalize(self, pos_tensor: torch.Tensor) -> torch.Tensor:
+        if self.mean is None or self.std is None:
+            return pos_tensor
+
+        mean_t = torch.from_numpy(self.mean).float().to(pos_tensor.device)
+        std_t = torch.from_numpy(self.std).float().to(pos_tensor.device)
+        
+        return pos_tensor * std_t + mean_t
+# =========================================================================
+
+
+class Mavic3Dataset(Dataset):
+    # Definindo as chaves de PCLs para usar no __getitem__ e no collate_fn
+    PCL_KEYS = ['lidar_360', 'livox_avia', 'radar'] 
+
+    # CORREÇÃO CRÍTICA: Adicionar 'normalizer' como argumento e inicializar corretamente
+    def __init__(self, data_root: str, all_timestamps: List[str], config: Dict[str, Any], normalizer: PositionNormalizer = None):
+        super().__init__()
         self.data_root = data_root
         self.config = config
-        self.phase = phase
-        
-        # Parâmetros principais
         self.img_size = config.get('image_size', 224)
-        self.feature_dim = config.get('modal_feature_dim', DEFAULT_FEATURE_DIM)
-        self.sequence_length = config.get('sequence_length', 10) 
-        # Latencia para Confirmed (Estado 2): N frames ADIANTE devem ser Detectados (1)
-        self.latency_frames = config.get('latency_frames', 3) 
+        # O feature_dim do PCL sera 9, a menos que o config diga o contrario
+        self.feature_dim = config.get('pcl_feature_dim', DEFAULT_FEATURE_DIM) 
+        self.sequence_length = config.get('sequence_length', 1)
+        self.all_timestamps = all_timestamps
+        # CORREÇÃO: Recebe o objeto normalizer
+        self.normalizer = normalizer 
+        self.modality_paths = {mod: os.path.join(self.data_root, mod) for mod in MODALITIES}
+        self.PCL_BRUTE_PATHS = ['lidar_360', 'livox_avia', 'radar_enhance_pcl']
 
-        # O split_folder aponta para a pasta onde estao as sequencias (e.g., .../MMNTT/train)
-        if self.phase == 'test' and 'val' in data_root: 
-            self.split_folder = data_root 
-        elif self.phase in ['val', 'test']:
-            self.split_folder = data_root 
-        else:
-            # Se for treino, presumimos que a estrutura e DATA_ROOT/phase
-            self.split_folder = os.path.join(self.data_root, self.phase) 
+        for mod, path in self.modality_paths.items():
+            if not os.path.isdir(path):
+                raise FileNotFoundError(f"Subpasta de modalidade '{mod}' nao encontrada em: {self.data_root}")
 
-        # 1. Carregamento dos metadados de split
-        with open(split_file_path, 'r') as f:
-            all_annotations = [line.strip() for line in f.readlines() if line.strip()]
-        
-        # 2. Agrupamento por Sequencia e Filtragem de Debug
-        self.annotations_by_sequence = defaultdict(list)
-        max_seq_index = config.get('max_seq_index_for_debug', None)
-        
-        # O split_file_path lista seqXX,timestamp. Vamos agrupar os frames validos.
-        for line in all_annotations:
-            if ',' not in line:
-                # Caso o split seja de seq folders (Teste Dummy), precisamos listar os frames
-                sequence_folder = line
-                image_path = os.path.join(self.split_folder, sequence_folder, 'Image')
-                if os.path.isdir(image_path):
-                    for filename in os.listdir(image_path):
-                        if filename.endswith('.png'):
-                            timestamp_id = filename.rsplit('.', 1)[0]
-                            self.annotations_by_sequence[sequence_folder].append(timestamp_id)
-            else:
-                sequence_folder, timestamp_id = line.split(',')
-                self.annotations_by_sequence[sequence_folder].append(timestamp_id)
-
-            # Logica de Limite de Sequencia para Debug
-            if max_seq_index is not None:
-                try:
-                    seq_number = int(sequence_folder[3:])
-                    if seq_number > max_seq_index:
-                        if sequence_folder in self.annotations_by_sequence:
-                            del self.annotations_by_sequence[sequence_folder]
-                        continue
-                except ValueError:
-                    continue 
-
-        # 3. Mapeamento de GT Simbolico (Mealy State) e Indexacao de Chunks
-        self.symbolic_gt_map = {}
-        self.sequence_chunks = []
-        
-        for seq_folder, timestamp_list in self.annotations_by_sequence.items():
-            if not timestamp_list:
-                continue
-
-            # Garante ordem temporal
-            timestamp_list.sort(key=float) 
-            
-            # 3.1. Carrega todos os GTs de Posicao e Classe (Raw) para a sequencia
-            raw_gt_pos_list = []
-            raw_gt_class_list = []
-            
-            for timestamp_id in timestamp_list:
-                sample_base_path = os.path.join(self.split_folder, seq_folder)
-                
-                # Prioriza a leitura de GT de classe NPY (0, 1 ou -1)
-                gt_class = self._load_npy(os.path.join(sample_base_path, 'class'), timestamp_id, is_class=True)
-                raw_gt_class_list.append(gt_class.item())
-                
-                # Carrega GT Posicao (usado apenas para referencia ou no modo de regressor puro)
-                gt_pos = self._load_npy(os.path.join(sample_base_path, 'ground_truth'), timestamp_id, gt_dim=3)
-                raw_gt_pos_list.append(gt_pos) 
-                
-            # 3.2. Calcula o GT Simbolico (Mealy State: 0, 1, 2, -1) para a sequencia completa
-            symbolic_gt_array = self._calculate_mealy_gt_for_sequence(raw_gt_class_list, self.latency_frames)
-            self.symbolic_gt_map[seq_folder] = (symbolic_gt_array, raw_gt_pos_list, timestamp_list)
-            
-            # 3.3. Cria os chunks de indices (seq_folder, start_index)
-            num_frames = len(timestamp_list)
-            num_chunks = math.floor(num_frames / self.sequence_length)
-            
-            for i in range(num_chunks):
-                start = i * self.sequence_length
-                # Armazenamos a pasta e o indice de inicio
-                self.sequence_chunks.append((seq_folder, start)) 
-                
-        print(f"Carregado {len(self.annotations_by_sequence)} sequencias. Total de {len(self.sequence_chunks)} chunks de tamanho {self.sequence_length}.")
-        if self.phase == 'train' and max_seq_index is not None:
-            print(f"DEBUG: Limitando a sequencias ate 'seq{max_seq_index:04d}'.")
+        print(f"Dataset inicializado com {len(self.all_timestamps)} amostras.")
 
     def __len__(self):
-        # O tamanho do dataset agora e o numero total de chunks
-        return len(self.sequence_chunks)
+        if self.sequence_length > 1:
+            return math.floor(len(self.all_timestamps) / self.sequence_length)
+        else:
+            return len(self.all_timestamps)
 
-    def __getitem__(self, index):
-        # Retorna um chunk temporal de tamanho T (self.sequence_length)
-        seq_folder, start_index = self.sequence_chunks[index]
-        
-        symbolic_gt_array, raw_gt_pos_list, timestamp_list = self.symbolic_gt_map[seq_folder]
-        
-        end_index = start_index + self.sequence_length
-        chunk_timestamps = timestamp_list[start_index:end_index]
-        
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        if self.sequence_length > 1:
+            start_index = index * self.sequence_length
+            end_index = start_index + self.sequence_length
+            chunk_timestamps = self.all_timestamps[start_index:end_index]
+        else:
+            chunk_timestamps = [self.all_timestamps[index]]
+
         sequence_data = defaultdict(list)
-        
-        for t, timestamp_id in enumerate(chunk_timestamps):
-            sample_base_path = os.path.join(self.split_folder, seq_folder) 
-            
-            # --- CARREGAMENTO DE INPUTS ---
-            sequence_data['image'].append(self._load_image(os.path.join(sample_base_path, 'Image'), timestamp_id))
-            sequence_data['lidar'].append(self._load_npy(os.path.join(sample_base_path, 'lidar_360'), timestamp_id, feature_dim=self.feature_dim))
-            sequence_data['radar'].append(self._load_npy(os.path.join(sample_base_path, 'radar_enhance_pcl'), timestamp_id, feature_dim=self.feature_dim))
-            # Ajuste no caminho para features de audio, que estao na raiz dos dados
-            # Assume que a estrutura é: DATA_ROOT/audio_features/seq_folder/timestamp.npy
-            sequence_data['audio'].append(self._load_npy(os.path.join(self.data_root, 'audio_features', seq_folder), timestamp_id, feature_dim=self.feature_dim)) 
-            
-            # --- CARREGAMENTO DE LABELS (Ground Truth) ---
-            
-            # 1. GT Class (Symbolic Mealy State): Pre-calculado [T]
-            # O GT ja esta no formato 0, 1, 2 ou -1.
-            gt_class = torch.tensor(symbolic_gt_array[start_index + t], dtype=torch.long)
-            sequence_data['gt_class'].append(gt_class)
-            
-            # 2. GT Posicao: Do NPY raw
-            gt_pos = raw_gt_pos_list[start_index + t]
-            # Garante que gt_pos não é um tensor escalar vazio
-            if gt_pos.dim() == 0 or gt_pos.numel() == 0: 
-                gt_pos = torch.zeros(3, dtype=torch.float) 
-            
-            sequence_data['gt_pos'].append(gt_pos)
 
-            # 3. Metadados
-            sequence_data['timestamp'].append(f"{seq_folder},{timestamp_id}") 
+        for timestamp_id in chunk_timestamps:
+            sample_data = self._load_single_sample(timestamp_id)
+            for key, value in sample_data.items():
+                sequence_data[key].append(value)
+
+        # ---------------------------------------------------------------------------------------
+        # APENAS GT e IMAGEM serao empilhados. PCLs serao retornadas como lista de tensores.
+        # ---------------------------------------------------------------------------------------
+        stacked_data = {}
+        for key, value_list in sequence_data.items():
+            if key == 'timestamp':
+                stacked_data['timestamp'] = sequence_data.get('timestamp', chunk_timestamps)
+                continue
             
-        # O timestamp deve ser uma lista de strings, nao um tensor empilhado
-        timestamps = sequence_data.pop('timestamp')
-        
-        # Concatena os tensores na dimensao do tempo (T). O shape sera [T, ...]
-        stacked_data = {
-            key: torch.stack(value, dim=0) for key, value in sequence_data.items()
-        }
-        
-        # Adiciona o metadata de volta como uma lista de strings
-        stacked_data['timestamp'] = timestamps 
-        
-        # O shape final de cada tensor em stacked_data (exceto 'timestamp') e: [T, BATCH_DIMENSIONS]
+            # PCLs (que agora sao features de tamanho FIXO): Devem ser empilhadas como o resto
+            if key in self.PCL_KEYS:
+                # Se PCLs estao retornando features de tamanho FIXO (9), elas devem ser empilhadas aqui!
+                stacked_data[key] = torch.stack(value_list, dim=0) 
+            else:
+                # DADOS FIXOS (Imagem, GT): Empilha ao longo da dimensao da sequencia (T)
+                stacked_data[key] = torch.stack(value_list, dim=0)
+
+        # Gera gt_class a partir de gt_pos
+        gt_pos_tensor = stacked_data['gt_pos']
+        # CORREÇÃO: Norma só deve ser calculada APÓS a normalização se a loss for normalizada
+        # Assumindo que o modelo prediz a posição NORMALIZADA, a distância ainda funciona.
+        distance_norm = torch.linalg.norm(gt_pos_tensor, dim=1) 
+        stacked_data['gt_class'] = (distance_norm > 1e-6).long()
+
         return stacked_data
 
-    # --- FUNCOES DE CALCULO E AUXILIARES ---
+    def _load_single_sample(self, timestamp_id: str) -> Dict[str, Any]:
+        sample_data = {}
+        sample_data['timestamp'] = timestamp_id
+        for modality, path in self.modality_paths.items():
+            output_key = OUTPUT_KEY_MAP.get(modality, modality)
+            
+            if modality == 'image':
+                sample_data[output_key] = self._load_image(path, timestamp_id)
+            
+            elif modality == 'ground_truth':
+                # GT: Mantem padding/truncamento para garantir o tamanho de saida fixo (3)
+                sample_data[output_key] = self._load_npy_exact(path, timestamp_id, target_dim=3)
+            
+            elif modality in self.PCL_BRUTE_PATHS:
+                # PCLs: Carrega o cache de features ou gera o cache e retorna as features.
+                sample_data[output_key] = self._load_pcl_data(path, timestamp_id)
+        
+        return sample_data
+
+    # --- FUNÇÃO DE EXTRAÇÃO DE FEATURES (Com amostragem) ---
+    def _extract_pcl_features(self, data_tensor: torch.Tensor, target_dim: int) -> torch.Tensor:
+        """Calcula features estatísticas (Mean, Max, StdDev) e garante o tamanho de saida fixo."""
+        
+        N_points = data_tensor.size(0)
+        
+        # 1. Fallback para PCLs vazias/inválidas
+        if N_points == 0 or data_tensor.ndim != 2 or data_tensor.size(1) < PCL_POINT_DIM:
+            return torch.zeros(target_dim, dtype=torch.float)
+
+        # 2. TRUNCAMENTO (Amostragem Aleatória)
+        if N_points > MAX_POINTS_TO_PROCESS:
+            # Garante amostragem determinística para caching consistente
+            # Note: seed fixo no Python 'random' nao garante determinismo do torch.randperm
+            indices = torch.randperm(N_points, generator=torch.Generator().manual_seed(42))[:MAX_POINTS_TO_PROCESS] 
+            data_tensor = data_tensor[indices]
+            if LOG_INCONSISTENCY: print(f"AVISO PCL: Amostrado para {MAX_POINTS_TO_PROCESS} pontos.")
+        
+        # 3. EXTRAÇÃO DE FEATURES ESTATÍSTICAS (Mean, Max, StdDev)
+        data_tensor = data_tensor[:, :PCL_POINT_DIM] # Garantir que so usa as 3 dimensoes principais
+        
+        mean_features = torch.mean(data_tensor, dim=0) 
+        max_features = torch.max(data_tensor, dim=0).values 
+        std_features = torch.nan_to_num(torch.std(data_tensor, dim=0), 0.) 
+        
+        final_features = torch.cat([mean_features, max_features, std_features], dim=0)
+        
+        # 4. Ajuste final do tamanho (Garantir que a saida e target_dim)
+        current_length = final_features.size(0)
+        if current_length > target_dim:
+            final_features = final_features[:target_dim]
+        elif current_length < target_dim:
+            padding_needed = target_dim - current_length
+            padding = torch.zeros(padding_needed, dtype=torch.float)
+            final_features = torch.cat((final_features, padding), 0)
+            
+        return final_features
+
+
+    # --- FUNÇÃO PCL: CARREGAR/GERAR FEATURE (Cache Lazy) ---
+    def _load_pcl_data(self, base_path: str, timestamp_id: str) -> torch.Tensor:
+        """Tenta carregar feature .pt. Se nao existir, carrega .npy, gera o .pt, salva e retorna."""
+        
+        # 1. Define caminhos
+        modality = base_path.split(os.sep)[-1]
+        feature_path = os.path.join(base_path, f"{timestamp_id}.pt")
+
+        # 2. Tenta carregar o cache (.pt)
+        if os.path.exists(feature_path):
+            try:
+                feature_tensor = torch.load(feature_path)
+                return feature_tensor
+            except Exception as e:
+                if LOG_INCONSISTENCY: print(f"AVISO: Cache .pt corrompido para {modality} {timestamp_id}. Regenerando. {e}")
+        
+        # 3. Se o cache nao existe/falhou, carrega os NPYs brutos (operaçao lenta)
+        paths = self._find_all_npy_by_int_prefix(base_path, timestamp_id)
+        POINT_DIM = 3
+        tensors = []
+        
+        if paths:
+            for p in paths:
+                try:
+                    data = np.load(p, allow_pickle=True).astype(np.float32)
+                    data_tensor = torch.from_numpy(data).float()
+                    
+                    if data_tensor.ndim >= 2 and data_tensor.shape[-1] >= POINT_DIM: 
+                        tensors.append(data_tensor)
+                    elif data_tensor.ndim == 1 and data_tensor.numel() > 0 and data_tensor.numel() % POINT_DIM == 0:
+                        N_points = data_tensor.numel() // POINT_DIM
+                        tensors.append(data_tensor.reshape(N_points, POINT_DIM))
+                except Exception as e:
+                    if LOG_INCONSISTENCY: print(f"Falha ao carregar PCL bruto {p}: {e}")
+                    
+            data_tensor_bruto = torch.cat(tensors, dim=0) if tensors else torch.zeros((0, POINT_DIM), dtype=torch.float)
+        else:
+            data_tensor_bruto = torch.zeros((0, POINT_DIM), dtype=torch.float)
+            
+        # 4. Extrai features
+        final_features = self._extract_pcl_features(data_tensor_bruto, self.feature_dim)
+        
+        # 5. Salva o cache (.pt) e retorna
+        try:
+            torch.save(final_features, feature_path)
+            if LOG_INCONSISTENCY: print(f"Cache gerado e salvo com sucesso em {feature_path}")
+        except Exception as e:
+            if LOG_INCONSISTENCY: print(f"AVISO CRÍTICO: Falha ao salvar cache em {feature_path}. {e}")
+            
+        return final_features
+
+    # --- FUNÇÃO DE BUSCA DE TODOS OS NPY PELO PREFIXO (PARTE INTEIRA) ---
+    def _find_all_npy_by_int_prefix(self, base_path: str, timestamp_id: str) -> List[str]:
+        # (Função mantida como no original, não alterada)
+        timestamp_int = int(float(timestamp_id))
+        candidates = []
+        try:
+            for filename in os.listdir(base_path):
+                if filename.endswith('.npy'):
+                    try:
+                        if int(float(filename.rsplit('.',1)[0])) == timestamp_int:
+                            candidates.append(os.path.join(base_path, filename))
+                    except ValueError:
+                        continue
+        except FileNotFoundError:
+            pass
+
+        return candidates
     
-    def _calculate_mealy_gt_for_sequence(self, raw_gt_class_list: List[int], latency: int) -> List[int]:
-        """
-        Converte a lista de Ground Truths de classe brutos (0, 1, -1) para 
-        os estados simbolicos do Transdutor Mealy (0: Bkg, 1: Cand, 2: Conf, -1: Absent).
+    # --- FUNCAO DE CARREGAMENTO DE IMAGEM (Usa o prefixo/loose) ---
+    def _load_image(self, base_path: str, timestamp_id: str) -> torch.Tensor:
+        """Busca o PRIMEIRO arquivo .png que tem a mesma parte inteira do timestamp (segundo)."""
+        timestamp_int_str = timestamp_id.split('.')[0]
         
-        Regra:
-        - Se o GT bruto for -1 (Absent/Unknown), o GT simbolico e -1 (ignorado pela loss).
-        - Se o GT bruto for 0 (Background), o GT simbolico e 0.
-        - Se o GT bruto for 1 (Detected):
-            - É verificado se a deteccao persiste por 'latency' quadros ADIANTE (i+1 até i+L).
-            - Se sim (Confirmed), o GT simbolico e 2.
-            - Se nao (Candidate), o GT simbolico e 1.
-        """
-        seq_len = len(raw_gt_class_list)
-        symbolic_gt = []
-
-        # 0: Background, 1: Candidate, 2: Confirmed, -1: Absent/Ignore
-        
-        for i in range(seq_len):
-            raw_class = raw_gt_class_list[i]
-            
-            if raw_class == -1:
-                # O estado 'Absent' (Drone fora do frame de treino/nao rastreado) 
-                # deve ser ignorado pela loss, usando -1.
-                symbolic_gt.append(-1) 
-            
-            elif raw_class == 0:
-                # Estado 'Background'
-                symbolic_gt.append(0)
-                
-            elif raw_class == 1:
-                # Estado 'Detected' (1). Aplicamos a logica de latencia (look-ahead).
-                
-                is_confirmed = True
-                # Verifica se os proximos 'latency' frames (i+1 a i+latency) tambem sao 'Detected' (1)
-                for j in range(1, latency + 1):
-                    # Se o indice ultrapassar o fim da sequencia OU o proximo frame NAO for 1
-                    if (i + j >= seq_len) or (raw_gt_class_list[i + j] != 1):
-                        is_confirmed = False
-                        break
-                        
-                if is_confirmed:
-                    # Se persistir por L frames futuros: Confirmed
-                    symbolic_gt.append(2)
-                else:
-                    # Se nao persistir por L frames: Candidate
-                    symbolic_gt.append(1)
-            
-            else:
-                # Fallback para qualquer outro valor inesperado, trata como Background
-                symbolic_gt.append(0)
-
-        return symbolic_gt
-
-
-    def _load_image(self, base_path, timestamp_id):
-        img_path = os.path.join(base_path, f"{timestamp_id}.png")
+        found_path = None
         try:
-            img = Image.open(img_path).convert('RGB')
-            img = img.resize((self.img_size, self.img_size))
-            # Normalização (0-255 -> 0.0-1.0)
-            return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
-        except Exception as e:
-            if LOG_INCONSISTENCY: print(f"AVISO: Falha ao carregar imagem {img_path}. {e}")
-            # Retorna tensor de zeros em caso de falha (3 canais, 224x224)
-            return torch.zeros((3, self.img_size, self.img_size), dtype=torch.float)
+            for filename in os.listdir(base_path):
+                if filename.endswith('.png') and filename.startswith(timestamp_int_str):
+                    found_path = os.path.join(base_path, filename)
+                    break 
+        except FileNotFoundError:
+            pass 
 
-    def _load_npy(self, base_path, timestamp_id, feature_dim=None, gt_dim=None, is_class=False):
-        npy_path = os.path.join(base_path, f"{timestamp_id}.npy")
+        if found_path:
+            try:
+                img = Image.open(found_path).convert('RGB')
+                img = img.resize((self.img_size, self.img_size))
+                return torch.from_numpy(np.array(img)).permute(2,0,1).float() / 255.0
+            except Exception as e:
+                if LOG_INCONSISTENCY: print(f"Falha ao carregar ou processar imagem {found_path}: {e}")
+                return torch.zeros((3,self.img_size,self.img_size), dtype=torch.float)
+        else:
+            if LOG_INCONSISTENCY: print(f"Falha de sincronizacao (somente int) para imagem {timestamp_id}. Retornando ZEROS.")
+            return torch.zeros((3,self.img_size,self.img_size), dtype=torch.float)
         
-        try:
-            data = np.load(npy_path, allow_pickle=True)
-            
-            if is_class:
-                # O GT de classe (original) é um escalar (0, 1 ou -1)
-                return torch.tensor(data.item(), dtype=torch.long)
-            
-            data_tensor = torch.from_numpy(data).float()
-            if data_tensor.ndim > 1:
-                data_tensor = data_tensor.flatten()
-            
-            # Logica de Padding/Truncamento para Features
-            if feature_dim:
-                current_length = data_tensor.size(0)
-                if current_length > feature_dim:
-                    data_tensor = data_tensor[:feature_dim]
-                    if LOG_INCONSISTENCY: print(f"AVISO: {npy_path} Truncado de {current_length} para {feature_dim}")
-                elif current_length < feature_dim:
-                    padding_needed = feature_dim - current_length
-                    padding = torch.zeros(padding_needed, dtype=torch.float)
-                    data_tensor = torch.cat((data_tensor, padding), 0)
-                    if LOG_INCONSISTENCY: print(f"AVISO: {npy_path} Padding de {current_length} para {feature_dim}")
-                
-                return data_tensor.reshape(feature_dim)
-            
-            # Logica para GT de Posicao (normalmente dim 3)
-            if gt_dim:
-                if data_tensor.size(0) >= gt_dim:
-                    return data_tensor[:gt_dim].float()
-                else:
-                    padding_needed = gt_dim - data_tensor.size(0)
-                    padding = torch.zeros(padding_needed, dtype=torch.float)
-                    return torch.cat((data_tensor, padding), 0).float()
-                
-            return data_tensor.float()
+    # --- FUNCAO NPY: CARREGAMENTO EXATO (PARA GROUND TRUTH) ---
+    def _load_npy_exact(self, base_path: str, timestamp_id: str, target_dim: int) -> torch.Tensor:
+        """Carrega o Ground Truth usando o timestamp_id EXATO (referencia de indice) e aplica NORMALIZAÇÃO."""
+        full_path = os.path.join(base_path, f"{timestamp_id}.npy")
+        data_tensor = torch.zeros(0)
 
+        if os.path.exists(full_path):
+            try:
+                data = np.load(full_path, allow_pickle=True)
+                # Garante que o GT é (3,)
+                data_tensor = torch.from_numpy(data).float().flatten()[:target_dim]
+            except Exception as e:
+                if LOG_INCONSISTENCY: print(f"Falha ao carregar ou processar GT exato {full_path}: {e}")
+                data_tensor = torch.zeros(0)
+
+        # 1. Fallback se não carregou
+        if data_tensor.numel() == 0:
+            if LOG_INCONSISTENCY: print(f"Falha na busca EXATA para GT {timestamp_id}. Retornando ZEROS.")
+            return torch.zeros(target_dim) if target_dim else torch.zeros(1)
+        
+        # 2. Aplica padding se necessário (apenas para o caso raro de arquivo com < 3 dim)
+        if data_tensor.numel() < target_dim:
+            padding = torch.zeros(target_dim - data_tensor.numel())
+            data_tensor = torch.cat([data_tensor, padding])
+            
+        # 3. CORREÇÃO CRÍTICA: Aplica NORMALIZAÇÃO no Ground Truth.
+        if self.normalizer:
+            # O normalizer espera (N_samples, D). Aqui N_samples = 1, D = 3.
+            data_tensor = self.normalizer.normalize(data_tensor.unsqueeze(0)).squeeze(0)
+            
+        return data_tensor
+
+
+# Funcao de divisao de dataset
+def get_mavic3_datasets(data_root: str, config: Dict[str, Any], test_size: float = 0.1, val_size: float = 0.1, random_state: int = 42) -> Dict[str, Mavic3Dataset]:
+    """
+    Funcao auxiliar para carregar todos os timestamps e dividir em Treino, Validacao e Teste.
+    CORREÇÃO CRÍTICA: Pré-carrega o GT de treino para calcular as estatísticas de normalização.
+    """
+    gt_path = os.path.join(data_root, 'ground_truth')
+    if not os.path.isdir(gt_path):
+        raise FileNotFoundError(f"Diretorio de Ground Truth nao encontrado em {gt_path}")
+
+    all_timestamps = sorted([f.rsplit('.',1)[0] for f in os.listdir(gt_path) if f.endswith('.npy')])
+    if not all_timestamps:
+        raise ValueError(f"Nenhum arquivo .npy encontrado em {gt_path}")
+
+    train_val_timestamps, test_timestamps = train_test_split(all_timestamps, test_size=test_size, random_state=random_state, shuffle=True)
+    val_ratio_in_train_val = val_size / (1 - test_size)
+    train_timestamps, val_timestamps = train_test_split(train_val_timestamps, test_size=val_ratio_in_train_val, random_state=random_state, shuffle=True)
+
+    print(f"\nDivisao do Dataset (Total: {len(all_timestamps)} amostras):")
+    print(f" - Treino: {len(train_timestamps)}")
+    print(f" - Validacao: {len(val_timestamps)}")
+    print(f" - Teste: {len(test_timestamps)}")
+
+    # ----------------------------------------------------------------------
+    # CORREÇÃO 1: Pré-carregar GT de Treino para Estatísticas de Normalização
+    # ----------------------------------------------------------------------
+    train_gt_positions = []
+    
+    # Adicionado tqdm para visualização do processo, já que é lento.
+    for timestamp_id in tqdm(train_timestamps, desc="Pre-carregando GT para normalização"):
+        full_path = os.path.join(gt_path, f"{timestamp_id}.npy")
+        try:
+            # Carrega e flatten para garantir que seja (D,)
+            data = np.load(full_path, allow_pickle=True).astype(np.float32).flatten()
+            if data.size >= 3:
+                train_gt_positions.append(data[:3])
         except Exception as e:
-            # Fallback em caso de arquivo NPY ausente
-            if LOG_INCONSISTENCY: print(f"AVISO: Falha ao carregar NPY {npy_path}. {e}")
-            if is_class:
-                # Retorna -1 para classe se o arquivo de GT estiver ausente (Ignorar)
-                return torch.tensor(-1, dtype=torch.long) 
-            if gt_dim:
-                return torch.zeros(gt_dim, dtype=torch.float) 
-            if feature_dim:
-                return torch.zeros(feature_dim, dtype=torch.float)
-            return torch.zeros(1, dtype=torch.float)
+            if LOG_INCONSISTENCY: print(f"Falha ao pré-carregar GT {full_path}: {e}")
+
+    if not train_gt_positions:
+        # Fallback para o caso de falha de carregamento
+        print("AVISO: Falha ao carregar Ground Truth de treino. Normalização desativada.")
+        pos_normalizer = PositionNormalizer(np.zeros((1,3))) 
+    else:
+        train_gt_positions_np = np.stack(train_gt_positions) # Shape: (N_samples, 3)
+        pos_normalizer = PositionNormalizer(train_gt_positions_np)
+        print(f"Normalizador de Posição inicializado. Média: {pos_normalizer.mean.mean():.4f}, Std: {pos_normalizer.std.mean():.4f}")
+    # ----------------------------------------------------------------------
+
+    # CORREÇÃO 2: Passar o objeto normalizador para todos os Datasets
+    return {
+        'train': Mavic3Dataset(data_root, train_timestamps, config, normalizer=pos_normalizer),
+        'val': Mavic3Dataset(data_root, val_timestamps, config, normalizer=pos_normalizer),
+        'test': Mavic3Dataset(data_root, test_timestamps, config, normalizer=pos_normalizer)
+    }
