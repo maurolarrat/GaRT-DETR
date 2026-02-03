@@ -1,2 +1,2 @@
 # IndisNET
-Insiscriminative Network for Anti-UAV
+Indiscriminate Network for Anti-UAV
