@@ -1,2 +1,2 @@
-# MMNTT
-Multimodal Neural Transductor Transformer
+# IndisNET
+Insiscriminative Network for Anti-UAV
