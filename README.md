@@ -1,76 +1,79 @@
-# IndisNET
-Indiscriminate Network for Anti-UAV
+# Documentação Técnica: Pipeline de Dados e Integração de Perda AntiUAV-RGBT
 
-Esta documentação técnica foi estruturada para refletir um rigor acadêmico adequado para avaliações de especialistas, focando na arquitetura de dados e nas implicações de design do pipeline de pré-processamento para rastreamento de alvos multimodais (RGBT).
+Este documento detalha a arquitetura do DataLoader e sua sinergia com o critério de otimização para o rastreamento multimodal de drones (Visível e Infravermelho).
 
-Documentação Técnica: Pipeline de Dados AntiUAVRGBT
-O pipeline implementado através da classe AntiUAVRGBTDataset e da função collate_fn_superior estabelece um fluxo de dados robusto para o treinamento de modelos de aprendizado profundo aplicados ao rastreamento e detecção de veículos aéreos não tripulados (UAVs) em espectro dual.
-1. Arquitetura da Classe AntiUAVRGBTDataset
-A classe herda de torch.utils.data.Dataset, adotando uma estratégia de carregamento baseada em sequências temporais em vez de frames isolados, o que é fundamental para modelos que exploram a correlação temporal.
-1.1. Estratégia de Cache e Gerenciamento de Memória
-No método __init__, o pipeline executa o parsing antecipado de todos os arquivos JSON de anotação.
- * Implicação Técnica: Esta abordagem elimina o gargalo de I/O de disco referente à leitura de metadados durante o loop de treinamento. Ao armazenar as coordenadas de Ground Truth (GT) e flags de existência na RAM (self.annotation_cache), otimiza-se o throughput da GPU, mantendo-a ocupada com o processamento de tensores de imagem.
-1.2. Filtro de Integridade Multimodal
-O código implementa um filtro determinístico para identificar valid_indices:
-valid_indices = [i for i in range(len(v_data["gt_rect"])) if len(v_data["gt_rect"][i]) == 4 ...]
+---
 
- * Funcionalidade: Garante que apenas frames com anotações de bboxes completas em ambas as modalidades (Visível e Infravermelho) sejam considerados.
- * Implicação: Previne falhas catastróficas durante o cálculo de perda (Loss) e assegura que a fusão multimodal ocorra sobre dados semanticamente alinhados.
-2. Dinâmica Temporal e Amostragem
-O método __getitem__ é o núcleo operacional da extração de dados.
-2.1. Janela Temporal Adaptativa (temporal_window)
-O parâmetro temporal_window define a profundidade da série temporal enviada ao modelo.
- * Amostragem Aleatória: Para sequências longas, um ponto de partida aleatório é selecionado, servindo como uma forma de Data Augmentation temporal.
- * Tratamento de Exceções (Padding): Caso a sequência seja inferior à janela, o pipeline aplica um padding de repetição do último frame válido. Isso mantém a dimensionalidade do tensor estática, requisito necessário para o processamento em lote (batch processing).
-2.2. Fusão de Canais de Entrada
-A fusão ocorre na dimensão dos canais:
-"x_input": torch.cat([torch.stack(vis_tensors), torch.stack(ir_tensors)], dim=1)
+## 1. Arquitetura da Classe `AntiUAVRGBTDataset`
 
- * Configuração de Saída: Resulta em um tensor de entrada com 4 canais (R, G, B, IR).
- * Implicação Acadêmica: Esta configuração caracteriza uma estratégia de Fusão Precoce (Early Fusion). O modelo recebe a informação térmica como um canal extra de textura/intensidade, permitindo que as primeiras camadas convolucionais aprendam filtros espaciais que correlacionam luz visível e calor simultaneamente.
-3. Normalização e Geometria de Bounding Boxes
-O pipeline realiza a conversão sistemática de coordenadas absolutas (pixels) para coordenadas relativas [0, 1].
-| Parâmetro | Transformação Realizada | Objetivo |
-|---|---|---|
-| Escalonamento | (x, y, w, h) / (W, H) | Independência de resolução de entrada. |
-| Centroide | x + (w/2) | Conversão para formato CXCYWH. |
-| Consistência | exist_vis AND exist_ir | Definição de presença real do alvo no par multimodal. |
- * Nota de Design: O uso do formato CXCYWH (Center X, Center Y, Width, Height) é o padrão para arquiteturas modernas como DETR ou YOLO, facilitando a convergência da regressão de bboxes.
-4. Agregação por collate_fn_superior
-A função de colação personalizada é responsável por organizar a estrutura de tensores para o DataLoader.
- * Dimensionalidade Final: O tensor x_input entregue ao modelo possui o shape:
-   
-   
-   Onde:
-   * B: Batch size (Lote).
-   * T: Temporal window (Janela temporal).
-   * C: 4 (Canais RGB + IR).
-   * H, W: Altura e largura definidas pelo transform.
-5. Resumo de Implicações de Parâmetros
- * root_dir & split: Definem o escopo de generalização do modelo.
- * temporal_window: Controla a carga de memória da GPU. Valores altos aumentam a capacidade de modelar oclusões, mas exigem mais VRAM.
- * transform: Parâmetro crítico. Diferenças de interpolação entre as modalidades Visível e IR podem introduzir artefatos se não forem tratadas de forma homogênea.
+A classe implementa um fluxo de dados baseado em **sequências temporais**, essencial para modelos que exploram a continuidade do movimento e a correlação entre sensores.
 
-6. Sinergia entre Dataloader e Funções de Perda (Loss Functions)
-A estrutura de dados fornecida pelo AntiUAVRGBTDataset — especificamente a normalização para o formato CXCYWH no intervalo [0, 1] — possui implicações diretas na estabilidade numérica e na convergência do otimizador.
-6.1. Regressão de Bounding Boxes: L1 e Generalized IoU (GIoU)
-O modelo prediz as coordenadas das caixas, que são comparadas aos alvos boxes_vis e boxes_ir gerados pelo Dataloader.
- * L1 Loss (Erro Absoluto): Atua diretamente sobre as coordenadas normalizadas. A normalização [0, 1] garante que erros em frames de alta resolução (Full HD) tenham o mesmo peso que erros em frames de baixa resolução, prevenindo que sequências com resoluções maiores dominem o gradiente.
- * GIoU Loss: Como as bboxes estão no formato centralizado (CX, CY, W, H), a função de custo pode calcular a intersecção sobre a união de forma invariante à escala.
-6.2. Supervisão de Existência e Classificação Binária
-O campo exist (tensor binário) atua como o Ground Truth para a cabeça de classificação de existência do drone.
- * Implicação: Como o Dataloader define a existência apenas quando o drone está presente em ambas as modalidades, o modelo é penalizado se confiar excessivamente em apenas um sensor que pode estar apresentando falso-positivos (ex: reflexos solares no Visível ou fontes de calor irrelevantes no IR).
-7. Fluxo de Tensores: Do Dataset ao Critério
-O diagrama abaixo ilustra como as dimensões dos tensores evoluem desde a amostragem no disco até a aplicação das métricas de erro.
+### 1.1. Gerenciamento de Memória e I/O
+No método `__init__`, o pipeline executa o *parsing* antecipado de todos os arquivos JSON.
+* **Anotação em Cache:** Os metadados são armazenados em `self.annotation_cache` (RAM), eliminando gargalos de I/O durante o treinamento.
+* **Filtro de Integridade:** Garante que apenas frames com anotações completas $[x, y, w, h]$ em ambas as modalidades sejam processados.
+
+### 1.2. Estratégia de Amostragem Temporal
+A extração de dados via `__getitem__` utiliza uma **Janela Temporal Adaptativa**:
+* **Temporal Window ($T$):** Define a profundidade da série temporal. Se a sequência for menor que $T$, aplica-se *padding* por repetição.
+* **Amostragem Aleatória:** Funciona como um aumento de dados temporal, permitindo que o modelo veja diferentes trechos do mesmo vídeo em épocas distintas.
+
+---
+
+## 2. Processamento Multimodal (Early Fusion)
+
+O pipeline funde as modalidades no nível de entrada, criando um tensor de 4 canais.
+
+### 2.1. Fusão de Canais
+A concatenação ocorre na dimensão dos canais:
+$$X_{input} \in \mathbb{R}^{B \times T \times 4 \times H \times W}$$
+Onde os 4 canais representam $\{R, G, B, IR\}$.
+
+* **Implicação Acadêmica:** Esta configuração caracteriza uma **Fusão Precoce**. Permite que o backbone aprenda filtros espaciais que correlacionam a assinatura térmica com as características visuais desde as camadas mais rasas.
+
+### 2.2. Normalização de Coordenadas
+As *Bounding Boxes* são convertidas de pixels para o intervalo $[0, 1]$ no formato $CXCYWH$:
+$$CX = \frac{x + w/2}{Width_{image}}, \quad CY = \frac{y + h/2}{Height_{image}}$$
+$$W = \frac{w}{Width_{image}}, \quad H = \frac{h}{Height_{image}}$$
+
+---
+
+## 3. Sinergia com Funções de Perda (Loss Functions)
+
+A estrutura de dados possui implicações diretas na estabilidade numérica e na convergência do otimizador.
+
+### 3.1. Regressão de Bounding Boxes
+O modelo compara as predições com os alvos `boxes_vis` e `boxes_ir`:
+* **L1 Loss (Erro Absoluto):** A normalização garante que erros em frames de diferentes resoluções tenham o mesmo peso, evitando que sequências de alta resolução dominem o gradiente.
+* **Generalized IoU (GIoU) Loss:** Calculada de forma invariante à escala, facilitada pelo formato centralizado das bboxes.
+
+### 3.2. Supervisão de Existência
+O campo `exist` (tensor binário) atua como a verdade fundamental para a cabeça de classificação.
+* **Critério Rigoroso:** O drone só "existe" se detectado em **ambas** as câmeras. Isso penaliza o modelo caso ele confie em sensores isolados que apresentam ruído (ex: reflexos no visível ou calor residual no IR).
+
+---
+
+## 4. Fluxo de Tensores: Do Dataset ao Critério
+
+A tabela abaixo descreve a evolução dimensional dos dados no pipeline:
+
 | Etapa | Tensor / Operação | Dimensão (Shape) | Função no Pipeline |
-|---|---|---|---|
-| Input | x_input | [B, T, 4, H, W] | Entrada multimodal (Early Fusion). |
-| GT Box | boxes_vis / boxes_ir | [B, T, 4] | Alvos para regressão geométrica. |
-| GT Exist | exist | [B, T] | Alvo para classificação de presença. |
-| Output | pred_boxes | [B, T, Q, 4] | Predições do modelo (Q queries). |
-8. Considerações sobre o "Tau Adaptativo" na Avaliação
-Embora o Dataloader entregue um valor binário de existência, o pipeline de validação utiliza uma técnica de Soft Accuracy (SA) baseada na confiança do modelo.
- * Métrica mSA: Em vez de um corte rígido (Threshold), a acurácia é ponderada pela confiança suavizada. Se o exist_gt for 0, o modelo deve minimizar sua confiança; se for 1, a pontuação é o produto da confiança pelo IoU alcançado.
- * Conexão com o Dataset: Esta métrica depende intrinsecamente da limpeza de dados realizada no __init__, onde frames ruidosos foram previamente filtrados para garantir que a penalização do modelo seja justa.
-Destaque para o Orientador:
-Esta arquitetura de dados foi projetada para ser agnóstica à resolução original dos sensores, permitindo que o modelo aprenda características semânticas de alto nível. A fusão precoce (4 canais) assegura que o backbone convolucional extraia features correlacionadas desde o primeiro nível de abstração espacial.
+| :--- | :--- | :--- | :--- |
+| **Input** | `x_input` | $[B, T, 4, H, W]$ | Entrada multimodal (Early Fusion). |
+| **GT Box** | `boxes_vis` / `boxes_ir` | $[B, T, 4]$ | Alvos para regressão geométrica. |
+| **GT Exist**| `exist` | $[B, T]$ | Alvo para classificação de presença. |
+| **Output** | `pred_boxes` | $[B, T, Q, 4]$ | Predições do modelo ($Q$ queries). |
+
+---
+
+## 5. Considerações sobre o "Tau Adaptativo" na Avaliação
+
+Diferente do treino (binário), a validação utiliza a técnica de **Soft Accuracy (SA)**:
+* **Métrica mSA:** A acurácia é ponderada pela confiança suavizada do modelo através de um limiar adaptativo $\tau$.
+* **Cálculo:** Se $Exist_{gt} = 1$, a pontuação é $Confiança \times IoU$. Se $Exist_{gt} = 0$, a pontuação é $1 - Confiança$.
+* **Dependência:** Esta métrica depende da limpeza de dados realizada no `__init__`, garantindo que a penalização seja aplicada apenas sobre frames com anotações confiáveis.
+
+---
+
+> **Destaque para a Revisão:**
+> Esta arquitetura de dados foi projetada para ser agnóstica à resolução original dos sensores. A fusão precoce (4 canais) assegura que o backbone convolucional extraia features correlacionadas desde o primeiro nível de abstração espacial, otimizando a detecção em ambientes complexos.
