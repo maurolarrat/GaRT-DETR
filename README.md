@@ -75,5 +75,27 @@ Diferente do treino (binário), a validação utiliza a técnica de **Soft Accur
 
 ---
 
+## 6. Sinergia entre Dataloader e Funções de Perda (Loss Functions)
+
+A estrutura de dados fornecida pelo `AntiUAVRGBTDataset` — especificamente a normalização para o formato $CXCYWH$ no intervalo $[0, 1]$ — possui implicações diretas na estabilidade numérica e na convergência do otimizador durante o cálculo do critério de perda.
+
+### 6.1. Regressão de Bounding Boxes: L1 e Generalized IoU (GIoU)
+O modelo prediz as coordenadas das caixas, que são comparadas aos alvos `boxes_vis` e `boxes_ir` gerados pelo Dataloader.
+
+* **L1 Loss (Erro Absoluto):** Atua diretamente sobre as coordenadas normalizadas. 
+    * **Implicação:** A normalização no intervalo $[0, 1]$ garante que erros em frames de alta resolução (ex: Full HD) tenham o mesmo peso que erros em frames de baixa resolução. Isso previne que sequências com resoluções maiores dominem o gradiente e enviesem o aprendizado.
+* **GIoU Loss (Generalized Intersection over Union):** Como as bboxes são entregues pelo Dataloader no formato centralizado ($CX, CY, W, H$), a função de custo pode calcular a intersecção sobre a união de forma invariante à escala.
+    * **Vantagem:** O GIoU resolve o problema de gradientes nulos quando não há sobreposição entre a predição e o alvo, algo crítico em alvos pequenos como drones.
+
+
+
+### 6.2. Supervisão de Existência e Classificação Binária
+O campo `exist` (tensor binário) gerado no `__getitem__` atua como o *Ground Truth* para a cabeça de classificação de existência do drone.
+
+* **Lógica de Consistência Multimodal:** O Dataloader define a existência ($exist = 1$) apenas quando o drone está presente em **ambas** as modalidades simultaneamente.
+* **Implicação no Treino:** O modelo é penalizado via *Cross Entropy* ou *Binary Cross Entropy* se confiar excessivamente em apenas um sensor. Isso obriga a rede a aprender uma representação robusta, ignorando falso-positivos comuns como reflexos solares no canal Visível ou fontes de calor irrelevantes (clutter) no canal Infravermelho.
+
+---
+
 > **Destaque para a Revisão:**
 > Esta arquitetura de dados foi projetada para ser agnóstica à resolução original dos sensores. A fusão precoce (4 canais) assegura que o backbone convolucional extraia features correlacionadas desde o primeiro nível de abstração espacial, otimizando a detecção em ambientes complexos.
