@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import json
 from PIL import Image
 from torch.utils.data import Dataset
@@ -19,12 +20,14 @@ class AntiUAVRGBTDataset(Dataset):
         root_dir: str,
         split: str = "train",
         transform=None,
-        temporal_window: int = 10,
+        temporal_window: int = 30,
+        max_frames_per_seq: int = 10,   
     ):
         self.root_dir = root_dir
         self.split = split
         self.transform = transform
         self.temporal_window = temporal_window
+        self.max_frames_per_seq = max_frames_per_seq  
 
         # Pasta do split
         self.split_dir = os.path.join(root_dir, split)
@@ -75,13 +78,22 @@ class AntiUAVRGBTDataset(Dataset):
         data = self.annotation_cache[seq_name]
         valid_indices = data["valid_indices"]
 
-        # Seleção da janela temporal
-        if len(valid_indices) >= self.temporal_window:
-            start = random.randint(0, len(valid_indices) - self.temporal_window)
-            selected_indices = valid_indices[start:start + self.temporal_window]
+        # Aplica MAX_FRAMES
+        if self.max_frames_per_seq is not None:
+            valid_indices = valid_indices[:self.max_frames_per_seq]
+
+        # Se a sequência tiver menos frames que a janela, completa repetindo último frame
+        if len(valid_indices) <= self.temporal_window:
+            selected_indices = valid_indices + [valid_indices[-1]] * (self.temporal_window - len(valid_indices))
         else:
-            selected_indices = valid_indices + \
-                [valid_indices[-1]] * (self.temporal_window - len(valid_indices))
+            # Escolhe um trecho aleatório de tamanho >= temporal_window
+            start_idx = random.randint(0, len(valid_indices) - self.temporal_window)
+            end_idx = len(valid_indices)  # pode ir até o final ou limitar a MAX_FRAMES
+            segment = valid_indices[start_idx:end_idx]
+
+            # Seleciona temporal_window frames uniformemente no segmento
+            idxs = np.linspace(0, len(segment)-1, num=self.temporal_window, dtype=int)
+            selected_indices = [segment[i] for i in idxs]
 
         vis_tensors, ir_tensors = [], []
         gt_vis, gt_ir = [], []
