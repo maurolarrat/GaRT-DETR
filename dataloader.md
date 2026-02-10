@@ -1,101 +1,72 @@
-# Documentação Técnica: Pipeline de Dados e Integração de Perda AntiUAV-RGBT
-
-Este documento detalha a arquitetura do DataLoader e sua sinergia com o critério de otimização para o rastreamento multimodal de drones (Visível e Infravermelho).
+Esta é a documentação atualizada do módulo `dataloader.py`, refletindo as novas lógicas de amostragem e os limites de frames por sequência para o dataset **Anti-UAV 300**.
 
 ---
 
-## 1. Arquitetura da Classe `AntiUAVRGBTDataset`
+# Documentação do Dataloader: AntiUAVRGBTDataset
 
-A classe implementa um fluxo de dados baseado em **sequências temporais**, essencial para modelos que exploram a continuidade do movimento e a correlação entre sensores.
+Este módulo implementa o carregamento de dados multimodal (RGB + Infravermelho) otimizado para o treinamento de modelos de rastreamento temporal. A nova versão introduz maior controle sobre a densidade da amostragem e limites de memória.
 
-### 1.1. Gerenciamento de Memória e I/O
-No método `__init__`, o pipeline executa o *parsing* antecipado de todos os arquivos JSON.
-* **Anotação em Cache:** Os metadados são armazenados em `self.annotation_cache` (RAM), eliminando gargalos de I/O durante o treinamento.
-* **Filtro de Integridade:** Garante que apenas frames com anotações completas $[x, y, w, h]$ em ambas as modalidades sejam processados.
+## 1. Modificações e Melhorias Recentes
 
-### 1.2. Estratégia de Amostragem Temporal
-A extração de dados via `__getitem__` utiliza uma **Janela Temporal Adaptativa**:
-* **Temporal Window ($T$):** Define a profundidade da série temporal. Se a sequência for menor que $T$, aplica-se *padding* por repetição.
-* **Amostragem Aleatória:** Funciona como um aumento de dados temporal, permitindo que o modelo veja diferentes trechos do mesmo vídeo em épocas distintas.
+Diferente da versão anterior, este dataloader agora inclui:
+
+* **`max_frames_per_seq`**: Um limitador que restringe quantos frames de uma sequência original serão considerados, útil para equilibrar o dataset ou acelerar épocas de treino.
+* **Amostragem Uniforme (Linspace)**: Quando uma sequência é maior que a janela temporal desejada, o código seleciona frames distribuídos uniformemente, garantindo que o modelo veja o "movimento" completo do drone em vez de apenas um trecho curto.
 
 ---
 
-## 2. Processamento Multimodal (Early Fusion)
+## 2. Parâmetros de Inicialização
 
-O pipeline funde as modalidades no nível de entrada, criando um tensor de 4 canais.
-
-### 2.1. Fusão de Canais
-A concatenação ocorre na dimensão dos canais:
-$$X_{input} \in \mathbb{R}^{B \times T \times 4 \times H \times W}$$
-Onde os 4 canais representam $\{R, G, B, IR\}$.
-
-* **Implicação Acadêmica:** Esta configuração caracteriza uma **Fusão Precoce**. Permite que o backbone aprenda filtros espaciais que correlacionam a assinatura térmica com as características visuais desde as camadas mais rasas.
-
-### 2.2. Normalização de Coordenadas
-As *Bounding Boxes* são convertidas de pixels para o intervalo $[0, 1]$ no formato $CXCYWH$:
-$$CX = \frac{x + w/2}{Width_{image}}, \quad CY = \frac{y + h/2}{Height_{image}}$$
-$$W = \frac{w}{Width_{image}}, \quad H = \frac{h}{Height_{image}}$$
+| Parâmetro | Tipo | Descrição |
+| --- | --- | --- |
+| `root_dir` | `str` | Caminho raiz do dataset Anti-UAV. |
+| `split` | `str` | Subconjunto de dados (ex: "train", "val", "test"). |
+| `temporal_window` | `int` | Tamanho fixo da sequência de saída (ex: 30 frames). |
+| `max_frames_per_seq` | `int` | Limite máximo de frames lidos por pasta de sequência. |
 
 ---
 
-## 3. Sinergia com Funções de Perda (Loss Functions)
+## 3. Lógica de Seleção de Frames
 
-A estrutura de dados possui implicações diretas na estabilidade numérica e na convergência do otimizador.
+O método `__getitem__` agora opera sob uma hierarquia de decisão para garantir que o tensor de saída tenha sempre o mesmo tamanho (`temporal_window`):
 
-### 3.1. Regressão de Bounding Boxes
-O modelo compara as predições com os alvos `boxes_vis` e `boxes_ir`:
-* **L1 Loss (Erro Absoluto):** A normalização garante que erros em frames de diferentes resoluções tenham o mesmo peso, evitando que sequências de alta resolução dominem o gradiente.
-* **Generalized IoU (GIoU) Loss:** Calculada de forma invariante à escala, facilitada pelo formato centralizado das bboxes.
+1. **Filtragem**: Apenas frames com Ground Truth (GT) válido em ambas as modalidades são carregados.
+2. **Truncamento**: Se definido, a sequência é cortada em `max_frames_per_seq`.
+3. **Caso A (Sequência Curta)**: Se a sequência disponível for menor que a janela, o sistema preenche o restante repetindo o último frame válido (*padding*).
+4. **Caso B (Sequência Longa)**:
+* Um segmento aleatório é escolhido dentro da sequência.
+* O código utiliza `np.linspace` para extrair `temporal_window` frames desse segmento de forma equidistante.
 
-### 3.2. Supervisão de Existência
-O campo `exist` (tensor binário) atua como a verdade fundamental para a cabeça de classificação.
-* **Critério Rigoroso:** O drone só "existe" se detectado em **ambas** as câmeras. Isso penaliza o modelo caso ele confie em sensores isolados que apresentam ruído (ex: reflexos no visível ou calor residual no IR).
+
 
 ---
 
-## 4. Fluxo de Tensores: Do Dataset ao Critério
+## 4. Estrutura do Tensor de Entrada (`x_input`)
 
-A tabela abaixo descreve a evolução dimensional dos dados no pipeline:
+O dataloader prepara os dados para uma arquitetura de fusão precoce (*early fusion*) ou processamento paralelo:
 
-| Etapa | Tensor / Operação | Dimensão (Shape) | Função no Pipeline |
-| :--- | :--- | :--- | :--- |
-| **Input** | `x_input` | $[B, T, 4, H, W]$ | Entrada multimodal (Early Fusion). |
-| **GT Box** | `boxes_vis` / `boxes_ir` | $[B, T, 4]$ | Alvos para regressão geométrica. |
-| **GT Exist**| `exist` | $[B, T]$ | Alvo para classificação de presença. |
-| **Output** | `pred_boxes` | $[B, T, Q, 4]$ | Predições do modelo ($Q$ queries). |
+* **Composição**: As imagens RGB (3 canais) e IR (1 canal) são empilhadas no eixo da dimensão de canais.
+* **Shape Final**: `[Janela_Temporal, 4, H, W]`
+* Canal 0, 1, 2: Informação visual (Red, Green, Blue).
+* Canal 3: Informação térmica (Infrared).
+
+
 
 ---
 
-## 5. Considerações sobre o "Tau Adaptativo" na Avaliação
+## 5. Normalização de Coordenadas (Ground Truth)
 
-Diferente do treino (binário), a validação utiliza a técnica de **Soft Accuracy (SA)**:
-* **Métrica mSA:** A acurácia é ponderada pela confiança suavizada do modelo através de um limiar adaptativo $\tau$.
-* **Cálculo:** Se $Exist_{gt} = 1$, a pontuação é $Confiança \times IoU$. Se $Exist_{gt} = 0$, a pontuação é $1 - Confiança$.
-* **Dependência:** Esta métrica depende da limpeza de dados realizada no `__init__`, garantindo que a penalização seja aplicada apenas sobre frames com anotações confiáveis.
+As Bounding Boxes são processadas para o formato de centro relativo para facilitar o cálculo de perdas de regressão:
 
----
-
-## 6. Sinergia entre Dataloader e Funções de Perda (Loss Functions)
-
-A estrutura de dados fornecida pelo `AntiUAVRGBTDataset` — especificamente a normalização para o formato $CXCYWH$ no intervalo $[0, 1]$ — possui implicações diretas na estabilidade numérica e na convergência do otimizador durante o cálculo do critério de perda.
-
-### 6.1. Regressão de Bounding Boxes: L1 e Generalized IoU (GIoU)
-O modelo prediz as coordenadas das caixas, que são comparadas aos alvos `boxes_vis` e `boxes_ir` gerados pelo Dataloader.
-
-* **L1 Loss (Erro Absoluto):** Atua diretamente sobre as coordenadas normalizadas. 
-    * **Implicação:** A normalização no intervalo $[0, 1]$ garante que erros em frames de alta resolução (ex: Full HD) tenham o mesmo peso que erros em frames de baixa resolução. Isso previne que sequências com resoluções maiores dominem o gradiente e enviesem o aprendizado.
-* **GIoU Loss (Generalized Intersection over Union):** Como as bboxes são entregues pelo Dataloader no formato centralizado ($CX, CY, W, H$), a função de custo pode calcular a intersecção sobre a união de forma invariante à escala.
-    * **Vantagem:** O GIoU resolve o problema de gradientes nulos quando não há sobreposição entre a predição e o alvo, algo crítico em alvos pequenos como drones.
-
-
-
-### 6.2. Supervisão de Existência e Classificação Binária
-O campo `exist` (tensor binário) gerado no `__getitem__` atua como o *Ground Truth* para a cabeça de classificação de existência do drone.
-
-* **Lógica de Consistência Multimodal:** O Dataloader define a existência ($exist = 1$) apenas quando o drone está presente em **ambas** as modalidades simultaneamente.
-* **Implicação no Treino:** O modelo é penalizado via *Cross Entropy* ou *Binary Cross Entropy* se confiar excessivamente em apenas um sensor. Isso obriga a rede a aprender uma representação robusta, ignorando falso-positivos comuns como reflexos solares no canal Visível ou fontes de calor irrelevantes (clutter) no canal Infravermelho.
+Isso garante que, independentemente da resolução da câmera (que pode variar entre o sensor visível e o térmico), os valores estejam sempre entre .
 
 ---
 
-> **Destaque para a Revisão:**
-> Esta arquitetura de dados foi projetada para ser agnóstica à resolução original dos sensores. A fusão precoce (4 canais) assegura que o backbone convolucional extraia features correlacionadas desde o primeiro nível de abstração espacial, otimizando a detecção em ambientes complexos.
+## 6. Funções Auxiliares: `collate_fn_superior`
+
+Esta função é passada para o `DataLoader` do PyTorch para organizar o batch. Ela transforma uma lista de dicionários (retornada pelo `__getitem__`) em um único dicionário de tensores batched:
+
+* **Inputs e Boxes**: Agrupados em tensores de dimensão `[Batch, Window, ...]`.
+* **Metadados**: Os nomes das sequências (`seq_names`) são mantidos como uma lista de strings para fins de depuração e avaliação.
+
+---
