@@ -6,13 +6,12 @@ from torch.utils.data import Dataset
 import torch
 import random
 
-
 class AntiUAVRGBTDataset(Dataset):
     '''
     Dataset para sequências RGBT.
-    - Cada modalidade mantém sua própria GT
-    - Existência local (RGB / IR)
-    - Existência global (RGB OR IR)
+    - Mantém dimensões originais das imagens.
+    - GTs em pixels reais [x, y, w, h].
+    - Retorna frames como lista para permitir resoluções variadas.
     '''
 
     def __init__(
@@ -29,17 +28,14 @@ class AntiUAVRGBTDataset(Dataset):
         self.temporal_window = temporal_window
         self.max_frames_per_seq = max_frames_per_seq  
 
-        # Pasta do split
         self.split_dir = os.path.join(root_dir, split)
 
-        # Lista de sequências
         folder_names = sorted([
             d for d in os.listdir(self.split_dir)
             if os.path.isdir(os.path.join(self.split_dir, d))
         ])
         self.sequences = folder_names
 
-        # Cache de anotações
         self.annotation_cache = {}
         print(f"Carregando anotações do split {split} na RAM...")
 
@@ -52,7 +48,6 @@ class AntiUAVRGBTDataset(Dataset):
             with open(os.path.join(seq_path, "infrared.json"), "r") as f:
                 ir_data = json.load(f)
 
-            # Frames válidos: GT definida nas duas modalidades
             valid_indices = [
                 i for i in range(len(v_data["gt_rect"]))
                 if len(v_data["gt_rect"][i]) == 4 and len(ir_data["gt_rect"][i]) == 4
@@ -78,108 +73,63 @@ class AntiUAVRGBTDataset(Dataset):
         data = self.annotation_cache[seq_name]
         valid_indices = data["valid_indices"]
 
-        # Aplica MAX_FRAMES
         if self.max_frames_per_seq is not None:
             valid_indices = valid_indices[:self.max_frames_per_seq]
 
-        # Se a sequência tiver menos frames que a janela, completa repetindo último frame
         if len(valid_indices) <= self.temporal_window:
             selected_indices = valid_indices + [valid_indices[-1]] * (self.temporal_window - len(valid_indices))
         else:
-            # Escolhe um trecho aleatório de tamanho >= temporal_window
             start_idx = random.randint(0, len(valid_indices) - self.temporal_window)
-            end_idx = len(valid_indices)  # pode ir até o final ou limitar a MAX_FRAMES
-            segment = valid_indices[start_idx:end_idx]
+            selected_indices = valid_indices[start_idx : start_idx + self.temporal_window]
 
-            # Seleciona temporal_window frames uniformemente no segmento
-            idxs = np.linspace(0, len(segment)-1, num=self.temporal_window, dtype=int)
-            selected_indices = [segment[i] for i in idxs]
-
-        vis_tensors, ir_tensors = [], []
+        vis_frames, ir_frames = [], []
         gt_vis, gt_ir = [], []
-
-        exist_vis_list = []
-        exist_ir_list = []
-        exist_global_list = []
+        exist_vis_list, exist_ir_list = [], []
 
         for k in selected_indices:
-            # Imagens
-            v_img = Image.open(
-                os.path.join(seq_path, "visible", data["files_vis"][k])
-            ).convert("RGB")
+            # Carrega imagens originais
+            v_img = Image.open(os.path.join(seq_path, "visible", data["files_vis"][k])).convert("RGB")
+            ir_img = Image.open(os.path.join(seq_path, "infrared", data["files_ir"][k])).convert("L")
 
-            ir_img = Image.open(
-                os.path.join(seq_path, "infrared", data["files_ir"][k])
-            ).convert("L")
-
-            Wv, Hv = v_img.size
-            Wir, Hir = ir_img.size
-
-            # Transformações
-            if isinstance(self.transform, dict):
-                v_t = self.transform["visible"](v_img)
-                ir_t = self.transform["infrared"](ir_img)
+            # Aplica transform apenas se existir (ex: ToTensor), sem Resize.
+            if self.transform:
+                v_t = self.transform["visible"](v_img) if isinstance(self.transform, dict) else self.transform(v_img)
+                ir_t = self.transform["infrared"](ir_img) if isinstance(self.transform, dict) else self.transform(ir_img)
             else:
-                v_t = self.transform(v_img)
-                ir_t = self.transform(ir_img)
+                v_t = torch.from_numpy(np.array(v_img)).permute(2,0,1).float() / 255.0
+                ir_t = torch.from_numpy(np.array(ir_img)).unsqueeze(0).float() / 255.0
 
-            vis_tensors.append(v_t)
-            ir_tensors.append(ir_t)
+            vis_frames.append(v_t)
+            ir_frames.append(ir_t)
 
-            # GT RGB
-            x, y, w, h = data["gt_rect_vis"][k]
-            gt_vis.append([
-                (x + w / 2) / Wv,
-                (y + h / 2) / Hv,
-                w / Wv,
-                h / Hv
-            ])
+            # GTs Reais em Pixels
+            gt_vis.append(data["gt_rect_vis"][k] if data["exist_vis"][k] > 0 else [0,0,0,0])
+            gt_ir.append(data["gt_rect_ir"][k] if data["exist_ir"][k] > 0 else [0,0,0,0])
 
-            # GT IR
-            x, y, w, h = data["gt_rect_ir"][k]
-            gt_ir.append([
-                (x + w / 2) / Wir,
-                (y + h / 2) / Hir,
-                w / Wir,
-                h / Hir
-            ])
-
-            # Existências
-            exist_vis = data["exist_vis"][k]
-            exist_ir = data["exist_ir"][k]
-
-            exist_vis_list.append(exist_vis)
-            exist_ir_list.append(exist_ir)
-            exist_global_list.append(1 if (exist_vis or exist_ir) else 0)
+            exist_vis_list.append(data["exist_vis"][k])
+            exist_ir_list.append(data["exist_ir"][k])
 
         return {
-            # Inputs separados por canal (não há fusão semântica)
-            "x_input": torch.cat(
-                [torch.stack(vis_tensors), torch.stack(ir_tensors)], dim=1
-            ),
-
-            # GTs
+            "vis_frames": vis_frames, # Lista de Tensores (C, H, W)
+            "ir_frames": ir_frames,   # Lista de Tensores (C, H, W)
             "boxes_vis": torch.tensor(gt_vis, dtype=torch.float32),
             "boxes_ir": torch.tensor(gt_ir, dtype=torch.float32),
-
-            # Existências
-            "exist": torch.tensor(exist_global_list, dtype=torch.float32),
             "exist_vis": torch.tensor(exist_vis_list, dtype=torch.float32),
             "exist_ir": torch.tensor(exist_ir_list, dtype=torch.float32),
-
             "seq_name": seq_name
         }
 
-
 def collate_fn_superior(batch):
+    '''
+    Collate que mantém frames como listas de listas, 
+    já que as resoluções podem variar entre sequências.
+    '''
     return {
-        "x_input": torch.stack([b["x_input"] for b in batch]),
+        "vis_frames": [b["vis_frames"] for b in batch], # Lista[Batch][Tempo]
+        "ir_frames": [b["ir_frames"] for b in batch],   # Lista[Batch][Tempo]
         "boxes_vis": torch.stack([b["boxes_vis"] for b in batch]),
         "boxes_ir": torch.stack([b["boxes_ir"] for b in batch]),
-
-        "exist": torch.stack([b["exist"] for b in batch]),
         "exist_vis": torch.stack([b["exist_vis"] for b in batch]),
         "exist_ir": torch.stack([b["exist_ir"] for b in batch]),
-
         "seq_names": [b["seq_name"] for b in batch]
     }
