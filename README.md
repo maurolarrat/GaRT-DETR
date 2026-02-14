@@ -29,9 +29,9 @@ Durante as primeiras 10 épocas, o modelo operou em regime de *warm-up* com peso
 
 ### 2. Transição de Regime (Época 11)
 
-Na época 11, o peso de existência foi elevado para .
+Na época 11, o peso de existência foi elevado (para 1.0).
 
-* **Impacto:** Houve um salto esperado na métrica de `Loss` (de  para ), mas o modelo absorveu o impacto mantendo a tendência de subida na acurácia global.
+* **Impacto:** Houve um salto esperado na métrica de `Loss` (de $4.18$ para $4.29$), mas o modelo absorveu o impacto mantendo a tendência de subida na acurácia global.
 
 ### 3. Dinâmica de Equilíbrio RGB-IR
 
@@ -43,10 +43,10 @@ Uma observação notável ocorre entre as **épocas 18 e 21**. Nota-se um fenôm
 
 ### 4. Status Atual (Época 22)
 
-* **Loss de Validação:** 
-* **Global IoU (Val):** 
-* **MSA Recorde (Val):**  (Época 18)
-* **Distribuição de Gate:** O modelo demonstra uma preferência consolidada pelo sensor Visível ( vs ), tratando o IR como um suporte informativo especializado.
+* **Loss de Validação:** $4.2841$
+* **Global IoU (Val):** $0.4097$
+* **MSA Recorde (Val):** $0.4075$ (Época 18)
+* **Distribuição de Gate:** O modelo demonstra uma preferência consolidada pelo sensor Visível ($G_V \approx 0.50$ vs $G_I \approx 0.15$), tratando o IR como um suporte informativo especializado.
 
 ---
 
