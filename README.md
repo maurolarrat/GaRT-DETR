@@ -6,9 +6,13 @@ Este repositório apresenta o progresso do treinamento de um modelo de segmenta�
 
 ### Figura 1: Convergência Global
 
+![Texto Alternativo](Figures/global_metrics.png)
+
 Análise da perda total (`Total Loss`) em relação às métricas de desempenho global (`Global IoU` e `Global MSA`).
 
 ### Figura 2: Dinâmica Modal e Gating
+
+![Texto Alternativo](Figures/modal_dynamics_final.png)
 
 Decomposição do desempenho por sensor e a contribuição relativa de cada um no mecanismo de *gating*.
 
