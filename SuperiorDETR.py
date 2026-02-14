@@ -51,34 +51,37 @@ def preprocess_batch(vis_frames_list, ir_frames_list, target_size=(224, 224)):
     # como se fossem imagens independentes, mantendo eficiência
     return torch.cat(processed_vis), torch.cat(processed_ir), orig_sizes_vis, orig_sizes_ir
 
-class GatedFusionBlock(nn.Module):
+class SpatialGatedFusionBlock(nn.Module):
     def __init__(self, d_model, nhead, temperature=2.0):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.temperature = temperature # <--- O fator de suavização
-        
-        self.gate = nn.Sequential(
+        self.temperature = temperature
+        # Gate atua por TOKEN (1x1 conv ou Linear por token)
+        self.spatial_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.ReLU(),
             nn.Linear(d_model // 4, 1)
         )
-        # Inicializa bias em 0 para que sigmoid(0/T) seja exatamente 0.5
-        nn.init.constant_(self.gate[-1].bias, 0.0) 
+        nn.init.constant_(self.spatial_gate[-1].bias, 0.0)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, f_main, f_aux):
-        # Aplicamos a temperatura na divisão antes da Sigmoid
-        # conf = sigmoid(logits / T)
-        gate_logits = self.gate(f_aux.mean(dim=1))
-        conf = torch.sigmoid(gate_logits / self.temperature).unsqueeze(1) 
+        # f_aux: [B, Tokens, d_model]
+        # Calcula confiança para cada região da imagem IR
+        spatial_logits = self.spatial_gate(f_aux) 
+        conf = torch.sigmoid(spatial_logits / self.temperature) # [B, Tokens, 1]
         
         f_fused, _ = self.cross_attn(f_main, f_aux, f_aux)
+
+        # Calcula a média e o desvio padrão real entre os tokens (espacial)
+        s_mean = conf.mean(dim=1) # Média por imagem no batch
+        s_std  = conf.std(dim=1)  # Desvio padrão real por imagem no batch
+        # -------------------
         
-        # O fluxo de informação de f_aux para f_main agora é mais "resistente" 
-        # a ser zerado abruptamente por variações de gradiente no início.
-        return self.norm(f_main + conf * f_fused), conf
+        # O IR (f_aux) entra no RGB (f_main) filtrado espacialmente
+        return self.norm(f_main + conf * f_fused), (s_mean, s_std)
     
-class GatedFusionBlock_sigmoid_simples_old(nn.Module):
+class GatedFusionBlock(nn.Module):
     def __init__(self, d_model, nhead):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
@@ -164,7 +167,7 @@ class RGBTBackbone(nn.Module):
         # RGB recebe informação do IR ponderada por um gate aprendido
         self.rgb_enhanced_by_ir = GatedFusionBlock(d_model, nhead)
         # IR recebe informação do RGB ponderada por outro gate independente
-        self.ir_enhanced_by_rgb = GatedFusionBlock(d_model, nhead)
+        self.ir_enhanced_by_rgb = SpatialGatedFusionBlock(d_model, nhead)
         # Bottleneck final:
         # Concatena RGB e IR já fundidos (2 * d_model)
         # Reduz novamente para d_model
@@ -209,7 +212,8 @@ class RGBTBackbone(nn.Module):
         # RGB recebe contexto do IR, ponderado por confiança aprendida
         f_rgb_fused, conf_ir = self.rgb_enhanced_by_ir(f_rgb, f_ir)
         # IR recebe contexto do RGB, ponderado por outra confiança
-        f_ir_fused, conf_rgb = self.ir_enhanced_by_rgb(f_ir, f_rgb)
+        # Agora capturamos a tupla (média, std) vinda do SpatialGatedFusionBlock
+        f_ir_fused, (conf_rgb_m, conf_rgb_s) = self.ir_enhanced_by_rgb(f_ir, f_rgb)
         # AGREGAÇÃO FINAL
         # Concatena as duas representações já fundidas
         # Bottleneck reduz para d_model
@@ -218,45 +222,63 @@ class RGBTBackbone(nn.Module):
         # - fused: memória multimodal pronta para o Transformer
         # - confs: scores médios de gate (úteis para diagnóstico)
         # - f_high_res: feature espacial para refinamento posterior
-        return fused, (conf_rgb, conf_ir), f_high_res
+        return fused, (conf_rgb_m, conf_ir, conf_rgb_s), f_high_res
 
 # ============================================================
 # 2. REFINEMENT LAYER (MELHORIA 3: SOFT ROI-ATTENTION)
 # ============================================================
 
 class RefinementLayer(nn.Module):
+    '''
+    Ela implementa uma "Atenção ROI Soft". Ao contrário de um DETR padrão que olha para a imagem inteira em todas as camadas, 
+    essa versão usa o attn_bias para forçar cada query a olhar prioritariamente para perto de onde ela acha que o drone está (ref_points).
+    Conforme o layer_idx aumenta, o foco fica mais fechado (o drone é um objeto pequeno), melhorando a precisão do MSA.
+    '''
     def __init__(self, d_model, nhead, layer_idx=0):
         super().__init__()
+        # Armazena o número de cabeças de atenção para uso no bias
         self.nhead = nhead
+        # Índice da camada (usado para ajustar o foco da atenção gaussiana)
         self.layer_idx = layer_idx
+        # Camada de Self-Attention para comunicação entre as queries (objetos)
         self.self_attn  = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        # Camada de Cross-Attention para buscar informações na memória visual (backbone)
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        # MLP para processamento das features extraídas após a atenção
         self.mlp = nn.Sequential(nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Linear(d_model * 4, d_model))
+        # Normalizações de camada para estabilidade do treinamento (Pre-norm/Post-norm)
         self.norm1, self.norm2, self.norm3 = nn.LayerNorm(d_model), nn.LayerNorm(d_model), nn.LayerNorm(d_model)
 
     def forward(self, q, memory, ref_points):
+        # Aplica Self-Attention com conexão residual e normalização
         q = self.norm1(q + self.self_attn(q, q, q)[0])
-        
+        # Obtém Batch size, número de Queries e tamanho da Memória
         B, N, _ = q.shape
         M = memory.shape[1]
         grid_side = int(math.sqrt(M))
-        
+        # Calcula o lado do grid (ex: 14 para memória 196) para mapeamento espacial
         # Grid dinâmico para evitar desalinhamento se M não for quadrado perfeito
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(0, 1, grid_side, device=q.device), 
             torch.linspace(0, 1, grid_side, device=q.device), indexing='ij'
         )
+        # Cria as coordenadas (x, y) do grid de memória normalizadas entre 0 e 1
         grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 2)[:, :M, :]
-        
+        # Calcula a distância Euclidiana entre cada query (ref_points) e cada ponto do grid
         dist = torch.cdist(ref_points[:, :, :2], grid) 
+        # Define o raio de atenção: fica mais "fino" (focado) conforme as camadas avançam
         sigma = 0.5 / (self.layer_idx + 1)
-        
+        # Gera um bias negativo (Gaussian-like) para silenciar regiões distantes do ref_point
         attn_bias = -(dist / sigma).pow(2) 
+        # Replica o bias para todas as cabeças de atenção do MultiheadAttention
         attn_bias = attn_bias.repeat_interleave(self.nhead, dim=0)
-
+        # Cross-Attention utilizando o bias espacial para focar na região da predição atual
         q_focussed, _ = self.cross_attn(q, memory, memory, attn_mask=attn_bias)
+        # Soma o resultado focado à query original (Residual) e normaliza
         q = self.norm2(q + q_focussed)
+        # Refinamento final das features através do MLP e última normalização
         q = self.norm3(q + self.mlp(q))
+        # Retorna as queries refinadas para a próxima camada ou predição
         return q
 
 # ============================================================
@@ -266,125 +288,162 @@ class RefinementLayer(nn.Module):
 class SuperiorDETR(nn.Module):
     def __init__(self, d_model=256, n_queries=30, n_layers=6, img_size=(224, 224)):
         super().__init__()
+        # Armazena a resolução de entrada alvo para o pré-processamento
         self.img_size = img_size
+        # Dimensão latente interna do Transformer (Canais)
         self.d_model = d_model
+        # Instancia o extrator de características multimodal (RGB + Infravermelho)
         self.backbone = RGBTBackbone(d_model)
+        # Embedding aprendido para as consultas (propostas de objetos)
         self.query_embed = nn.Embedding(n_queries, d_model)
-
+        # Pontos de referência (x, y, w, h) iniciais para cada query
         self.ref_points = nn.Embedding(n_queries, 4)
-        # Inicialização Proporcional (Grid)
+        # Inicialização Proporcional (Grid) para cobrir a imagem uniformemente
         with torch.no_grad():
-            # Cria um grid (ex: se n_queries=20, tentamos algo perto de 4x5 ou 2x10)
+            # Calcula a densidade do grid baseada no número de queries
             side_x = int(math.sqrt(n_queries))
             side_y = n_queries // side_x
-            
+            # Gera coordenadas espaciais distribuídas entre 0.1 e 0.9 do frame
             grid_y, grid_x = torch.meshgrid(
                 torch.linspace(0.1, 0.9, side_y),
                 torch.linspace(0.1, 0.9, side_x),
                 indexing='ij'
             )
+            # Reorganiza o grid para o formato de lista de coordenadas [N, 2]
             grid = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
             
             # Se sobrar query por conta da divisão, as outras ficam no centro
             self.ref_points.weight.data.fill_(0.5) 
+            # Sobrescreve as primeiras queries com as posições do grid gerado
             self.ref_points.weight.data[:grid.size(0), :2] = grid
-            # Tamanho inicial pequeno (5% do frame)
+            # Define o tamanho inicial das caixas como 5% da imagem (foco em objetos pequenos)
             self.ref_points.weight.data[:, 2:] = 0.05
-
-        self.bbox_head = nn.Linear(d_model, 4)
+        # Cabeça de predição de Bounding Box para o braço Visível
+        self.bbox_head_vis = nn.Linear(d_model, 4)
+        # Cabeça de predição de Bounding Box para o braço Infravermelho
+        self.bbox_head_ir  = nn.Linear(d_model, 4)
+        # Cabeças de classificação: probabilidade de existência no Visível, IR e Global
         self.exist_vis_head = nn.Linear(d_model, 1)
         self.exist_ir_head  = nn.Linear(d_model, 1)
         self.exist_glb_head = nn.Linear(d_model, 1) 
-
+        # Encoder do Transformer para refinar a memória multimodal globalmente
         self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model, 8, 1024, batch_first=True), num_layers=2)
+        # Lista de camadas de refinamento iterativo com Atenção ROI-Soft
         self.layers = nn.ModuleList([RefinementLayer(d_model, 8, layer_idx=i) for i in range(n_layers)])
+        # Compressor para integrar as features de alta resolução extraídas via Grid Sample
         self.local_compressor = nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
 
     def forward(self, vis_frames, ir_frames):
+        # Obtém dimensões do batch (B) e profundidade temporal (T)
         B, T = len(vis_frames), len(vis_frames[0])
+        # Redimensiona e normaliza os frames de ambos os sensores
         x_rgb, x_ir, o_vis, o_ir = preprocess_batch(vis_frames, ir_frames, target_size=self.img_size)
-
-        memory_all, gates, high_res_feat = self.backbone(x_rgb, x_ir)
+        # Processa a memória no Encoder e remodela para separar Batch e Tempo
+        memory_all, gates_info, high_res_feat = self.backbone(x_rgb, x_ir)
+        # Remodela features de alta resolução para uso no mecanismo de zoom (grid_sample)
+        conf_rgb_m, conf_ir, conf_rgb_s = gates_info 
+        # Inicializa listas para armazenar predições de toda a sequência
         memory_all = self.encoder(memory_all).view(B, T, -1, self.d_model)
+        # Remodela features de alta resolução para uso no mecanismo de zoom (grid_sample)
         high_res_feat = high_res_feat.view(B, T, self.d_model, 56, 56)
-
+        # Inicializa listas para armazenar predições de toda a sequência
         all_boxes, all_ev, all_ei, all_eg = [], [], [], []
+        # Prepara as queries iniciais repetindo o embedding para o batch
         Q_t = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
-        ref_t_logits = torch.logit(self.ref_points.weight.unsqueeze(0).repeat(B, 1, 1).clamp(1e-4, 1-1e-4))
-        
-        # Inicializamos os estados anteriores como None
+        # Converte pontos de referência para espaço Logit para atualizações numéricas estáveis
+        ref_vis_logits = torch.logit(self.ref_points.weight.unsqueeze(0).repeat(B, 1, 1).clamp(1e-4, 1-1e-4))
+        # Inicializa os logits do IR como cópia do visível (ponto de partida comum)
+        ref_ir_logits  = ref_vis_logits.clone()
+        # Listas para guardar caixas específicas de cada sensor por frame
+        all_boxes_vis, all_boxes_ir = [], [] # Substitui o all_boxes antigo
+        # Variáveis para persistência temporal (estado do frame anterior)
         last_ev, last_ei, last_eg = None, None, None
-
+        # Loop através de cada frame na sequência temporal
         for t in range(T):
-            # Lógica Temporal Robusta
+            # Mecanismo de Propagação Temporal: usa confiança do frame t-1 para guiar t
             if t > 0 and last_eg is not None:
-                # Pegamos a confiança máxima entre os 3 sinais do frame anterior
-                # Isso garante compatibilidade total com o seu MultimodalCriterion
+                # Calcula a confiança máxima entre as cabeças para decidir a taxa de atualização
                 combined_conf = torch.max(torch.max(last_ev, last_ei), last_eg)
+                # Alpha define o quanto manter da predição anterior (Smooth Tracking)
                 alpha = torch.sigmoid(combined_conf).unsqueeze(-1) 
-                
+                # Interpolação linear das Queries entre o estado atual e o embedding base
                 Q_t = Q_t * alpha + self.query_embed.weight * (1.0 - alpha)
+                # Logits base das caixas de referência
                 base_logits = torch.logit(self.ref_points.weight.unsqueeze(0).clamp(1e-4, 1-1e-4))
-                ref_t_logits = ref_t_logits * alpha + base_logits * (1.0 - alpha)
-            
+                # Propaga a localização das caixas para o próximo frame baseada na confiança
+                ref_vis_logits = ref_vis_logits * alpha + base_logits * (1.0 - alpha)
+                ref_ir_logits  = ref_ir_logits * alpha + base_logits * (1.0 - alpha)
+            # Seleciona memória e features de alta resolução do frame atual
             mem_t, hr_t = memory_all[:, t], high_res_feat[:, t]
-            
+            # Refinamento progressivo através das camadas do Transformer
             for i, layer in enumerate(self.layers):
-                ref_t = torch.sigmoid(ref_t_logits)
-                Q_t = layer(Q_t, mem_t, ref_t)
+                # Calcula a média geométrica das predições Vis/IR para centralizar a atenção
+                ref_mean = torch.sigmoid((ref_vis_logits + ref_ir_logits) / 2.0)
+                # Executa a camada de atenção espacialmente focada (Soft-ROI)
+                Q_t = layer(Q_t, mem_t, ref_mean)
+                # Intervenção de Alta Resolução (Zoom) na camada intermediária
                 if i == 2: # High-Res Zoom
-                    B, N, _ = Q_t.shape # 8, 20
-                    sampling_grid = self._make_sampling_grid(ref_t) # [8, 20, 49, 2]
-                    
-                    # FATO: Expandimos a imagem para que cada query tenha sua própria "cópia" para amostrar
-                    # [8, 256, 56, 56] -> [8, 20, 256, 56, 56] -> [160, 256, 56, 56]
+                    B, N, _ = Q_t.shape
+                    # O zoom também utiliza a referência média
+                    # Cria grid de amostragem focado na caixa média atual
+                    sampling_grid = self._make_sampling_grid(ref_mean)
+                    # Expande features de alta resolução para processar cada query individualmente
                     hr_t_exp = hr_t.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(B * N, self.d_model, 56, 56)
-                    
-                    # FATO: Ajustamos o grid para ser 160 amostragens de 7x7 (total 49 pontos)
-                    # [8, 20, 49, 2] -> [160, 7, 7, 2]
+                    # Ajusta grid para o formato exigido pelo grid_sample
                     grid_exp = sampling_grid.reshape(B * N, 7, 7, 2)
-                    
-                    # Agora sim: 160 imagens sendo amostradas por 160 grids
-                    local_f = F.grid_sample(hr_t_exp, grid_exp, align_corners=False) # [160, 256, 7, 7]
-                    
-                    # Voltamos para o shape da Query: [8, 20, 256]
+                    # Recorta e redimensiona (ROI Align manual) o patch de alta resolução
+                    local_f = F.grid_sample(hr_t_exp, grid_exp, align_corners=False)
+                    # Agrega informação espacial do patch e integra na Query via compressor
                     local_f = local_f.view(B, N, self.d_model, -1).mean(dim=-1) 
-                    
                     Q_t = Q_t + 0.1 * self.local_compressor(local_f)
-
-                delta = self.bbox_head(Q_t) # Sem tanh() aqui para permitir variação no espaço logit
-                ref_t_logits = ref_t_logits + delta * 0.1
-
-            # Calculamos as saídas das 3 cabeças
+                # Atualização desacoplada: cada sensor refina seu próprio deslocamento (delta)
+                # Isso permite que a caixa IR e Visível divirjam se houver paralaxe ou oclusão
+                ref_vis_logits = ref_vis_logits + self.bbox_head_vis(Q_t) * 0.1
+                ref_ir_logits  = ref_ir_logits  + self.bbox_head_ir(Q_t) * 0.1
+            # Calcula probabilidades de existência (classificação) para o frame atual
             ev_t = self.exist_vis_head(Q_t).squeeze(-1)
             ei_t = self.exist_ir_head(Q_t).squeeze(-1)
             eg_t = self.exist_glb_head(Q_t).squeeze(-1)
-
-            # Guardamos para o retorno
-            all_boxes.append(ref_t)
+            # Converte logits finais para coordenadas [0, 1] e armazena
+            all_boxes_vis.append(torch.sigmoid(ref_vis_logits))
+            all_boxes_ir.append(torch.sigmoid(ref_ir_logits))
+            # Armazena scores de confiança para supervisão e uso no próximo passo temporal
             all_ev.append(ev_t)
             all_ei.append(ei_t)
             all_eg.append(eg_t)
-            
-            # Atualizamos os estados para o próximo frame (t+1)
+            # Atualiza o estado "anterior" para a próxima iteração do loop t
             last_ev, last_ei, last_eg = ev_t, ei_t, eg_t
-
+        # Retorna dicionário completo com predições, métricas de fusão e metadados
         return {
-            "pred_boxes": torch.stack(all_boxes, dim=1),
+            "pred_boxes_vis": torch.stack(all_boxes_vis, dim=1),
+            "pred_boxes_ir":  torch.stack(all_boxes_ir, dim=1),
             "exist_vis":  torch.stack(all_ev, dim=1),
             "exist_ir":   torch.stack(all_ei, dim=1),
             "exist":      torch.stack(all_eg, dim=1),
-            "gate_scores": gates, 
-            "gate_vis_avg": gates[0].mean(), 
-            "gate_ir_avg": gates[1].mean(),
+            "gate_scores": gates_info,        
+            "gate_vis_avg": conf_rgb_m.mean(), # Usando os valores desempacotados
+            "gate_ir_avg":  conf_ir.mean(),    # Usando os valores desempacotados
+            "gate_ir_std":  conf_rgb_s.mean(), # A NOVA CHAVE para o log do desvio padrão
             "orig_sizes": (o_vis, o_ir)
         }
 
     def _make_sampling_grid(self, ref_t, size=7):
+        # Obtém Batch Size (B) e Número de Queries (N) das caixas de referência
         B, N, _ = ref_t.shape
+        # Converte os centros (x, y) de [0, 1] para o espaço [-1, 1] exigido pelo grid_sample
+        # Fórmula: (v * 2) - 1
         centers = (ref_t[:, :, :2] * 2 - 1)
+        # Define a escala do recorte (w, h) baseada nas dimensões da Bounding Box
+        # Multiplicamos por 1.5 para dar uma "margem" extra ao redor do drone (contexto local)
         scales = ref_t[:, :, 2:].view(B, N, 1, 2) * 1.5
+        # Cria uma linha linear de -1 a 1 com 'size' pontos (ex: 7 pontos)
         patch_range = torch.linspace(-1, 1, size, device=ref_t.device)
+        # Gera um grid 2D local unitário (como se fosse uma mini-imagem centralizada em 0,0)
         gy, gx = torch.meshgrid(patch_range, patch_range, indexing='ij')
+        # Empilha e formata o grid local para [1, 1, total_pontos, 2]
         rel_grid = torch.stack([gx, gy], dim=-1).view(1, 1, -1, 2)
+        # Projeta o grid unitário para o local correto:
+        # 1. Multiplica o grid relativo pela escala da caixa (dimensionamento)
+        # 2. Adiciona o centro da caixa (posicionamento no frame global)
+        # 3. Clamp(-1, 1) garante que o recorte não tente sair das bordas da imagem
         return (centers.view(B, N, 1, 2) + rel_grid * scales).clamp(-1, 1)
