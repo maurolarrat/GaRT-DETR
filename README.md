@@ -1,6 +1,6 @@
 # Relatório de Treinamento: Fusão de Sensores RGB-IR
 
-Este repositório apresenta o progresso do treinamento de um modelo de segmentação/detecção baseado em fusão de dados multi-modais (Visível e Infravermelho). O experimento está configurado para 300 épocas, e este documento analisa o comportamento do modelo até a **Época 22**.
+Este repositório apresenta o progresso do treinamento de um modelo de segmentação/detecção baseado em fusão de dados multi-modais (Visível e Infravermelho). O experimento está configurado para 300 épocas, e este documento analisa o comportamento do modelo até a **Época apresentada nas figuras**.
 
 ## Visão Geral das Métricas
 
@@ -41,11 +41,25 @@ Uma observação notável ocorre entre as **épocas 18 e 21**. Nota-se um fenôm
 * **A Extração de Informação:** O modelo parece utilizar o sensor IR para buscar informações complementares quando o sensor Visível (RGB) atinge um platô ou apresenta falhas de representação.
 * **Recuperação:** Após esse breve aumento de dependência do IR, o modelo tende a retornar ao favorecimento do sensor RGB. Na Época 22, o `Global IoU` e o `MSA` apresentam sinal de recuperação, sugerindo que o modelo utilizou a informação extraída do IR para refinar sua predição final e restabelecer o equilíbrio, com o RGB voltando a ser o guia principal.
 
-### 4. Status Atual (Época 22)
+### 4. Status Atual
+[RESULTADOS DA ÉPOCA 57]
+MÉTRICA      | TREINO     | VALIDAÇÃO 
+----------------------------------------
+GATE_IR_AVG  | 0.14 (±0.02)    | 0.13 (±0.01)   
+GATE_VIS_AVG | 0.51 (±0.00)    | 0.51 (±0.00)   
+IOU_GLOBAL   | 0.5539          | 0.5254         
+IOU_IR_AVG   | 0.54 (±0.00)    | 0.51 (±0.00)   
+IOU_VIS_AVG  | 0.56 (±0.00)    | 0.53 (±0.00)   
+LOSS         | 4.1652          | 4.2463         
+MSA_GLOBAL   | 0.6990          | 0.6687         
+MSA_IR_AVG   | 0.67 (±0.00)    | 0.65 (±0.00)   
+MSA_VIS_AVG  | 0.71 (±0.00)    | 0.67 (±0.00)   
 
-* **Loss de Validação:** $4.2841$
-* **Global IoU (Val):** $0.4097$
-* **MSA Recorde (Val):** $0.4075$ (Época 18)
+[!] Novo recorde de MSA: 0.6687. Peso salvo.
+
+* **Loss de Validação:** $4.2463 (está ponderada, e ainda não normalizada)$
+* **Global IoU (Val):** $0.5254$
+* **MSA Recorde (Val):** $0.6687$ (Época 57)
 * **Distribuição de Gate:** O modelo demonstra uma preferência consolidada pelo sensor Visível ($G_V \approx 0.50$ vs $G_I \approx 0.15$), tratando o IR como um suporte informativo especializado.
 
 ---
@@ -61,6 +75,6 @@ O treinamento continua em execução. A expectativa é observar se:
 
 ### O que foi considerado na análise:
 
-* **Citação dos Logs:** Usei os valores exatos de Loss e IoU da Época 11 e 22 para validar a transição.
+* **Citação dos Logs:** Usei os valores exatos de Loss e IoU da Época 11 e em diante para validar a transição.
 * **Fenômeno do IR:** Descrevi o meu insight pessoal sobre o modelo "ir buscar informação no IR" de forma técnica, chamando de "compensação modal" e "refinamento de equilíbrio".
 * **Imparcialidade:** O texto reconhece que o processo ainda está em curso e que as oscilações são normais em sistemas de fusão dinâmica.
