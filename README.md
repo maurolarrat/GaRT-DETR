@@ -22,7 +22,7 @@ Decomposição do desempenho por sensor e a contribuição relativa de cada um n
 
 ### 1. Período de Warm-up (Épocas 1-10)
 
-Durante as primeiras 10 épocas, o modelo operou em regime de *warm-up* com peso de existência reduzido ().
+Durante as primeiras 10 épocas, o modelo operou em regime de *warm-up* com peso de existência reduzido (0.2).
 
 * **Comportamento:** Observa-se uma queda acentuada na `Loss` e um crescimento linear consistente no `Global IoU` e `MSA`.
 * **Estabilidade:** O mecanismo de *gating* começou com uma distribuição equilibrada (próxima a 0.5), mas rapidamente começou a aprender a relevância de cada sensor para a tarefa inicial.
