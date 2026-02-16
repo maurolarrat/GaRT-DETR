@@ -18,7 +18,6 @@ NUM_EPOCHS = 300
 ROOT_DIR = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT"
 LEARNING_RATE = 1e-4
 
-# No seu script de treino, ajuste assim:
 transform = {
     "visible": transforms.Compose([
         transforms.ToTensor(), # Converte para 0-1
@@ -63,7 +62,6 @@ def generalized_box_iou(boxes1, boxes2):
     Calcula a Generalized IoU entre dois conjuntos de caixas.
     boxes1, boxes2: [N, 4] no formato XYXY
     """
-    # 1. IoU Padrão
     lt = torch.max(boxes1[:, :2], boxes2[:, :2])
     rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
     wh = (rb - lt).clamp(min=0)
@@ -74,7 +72,6 @@ def generalized_box_iou(boxes1, boxes2):
     union = area1 + area2 - inter + 1e-6
     iou = inter / union
 
-    # 2. Área do Menor Invólucro Convexo (C)
     lt_c = torch.min(boxes1[:, :2], boxes2[:, :2])
     rb_c = torch.max(boxes1[:, 2:], boxes2[:, 2:])
     wh_c = (rb_c - lt_c).clamp(min=0)
@@ -230,8 +227,8 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
     epoch_logs = {
         "loss": [], 
         "iou_global": [], "msa_global": [], 
-        "iou_vis_avg": [], "msa_vis_avg": [], # Adicionado
-        "iou_ir_avg": [], "msa_ir_avg": [],   # Adicionado
+        "iou_vis_avg": [], "msa_vis_avg": [],
+        "iou_ir_avg": [], "msa_ir_avg": [],
         "gate_vis_avg": [], "gate_ir_avg": [],
         "gate_vis_std": [], "gate_ir_std": [] 
     }
@@ -258,23 +255,17 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
                 epoch_logs[k].append(val)
 
         # LOG DOS GATES (Vindo do forward do modelo)
-        for g_key in ["gate_vis_avg", "gate_ir_avg", "gate_ir_std"]:
+        for g_key in ["gate_vis_avg", "gate_ir_avg", "gate_vis_std", "gate_ir_std"]:
             if g_key in outputs:
                 val = outputs[g_key]
                 val = val.item() if torch.is_tensor(val) else val
                 epoch_logs[g_key].append(val)
         
-        # O Visível é global por imagem 
-        if "gate_vis_avg" in outputs:
-            epoch_logs["gate_vis_std"].append(0.0)
-        
-        # MANTÉM O POSTFIX, mas adiconei o desvio padrão visualmente
         pbar.set_postfix({
             "Loss": f"{np.mean(epoch_logs['loss']):.4f}",
             "IoU": f"{np.mean(epoch_logs['iou_global']):.4f}",
-            
             "G_V": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}±{np.mean(epoch_logs['gate_vis_std']):.2f}" if epoch_logs['gate_vis_avg'] else "N/A",
-            "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}±{np.mean(epoch_logs['gate_ir_std']):.2f}"
+            "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}±{np.mean(epoch_logs['gate_ir_std']):.2f}" if epoch_logs['gate_ir_avg'] else "N/A"
         })
 
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in epoch_logs.items()}
@@ -353,10 +344,8 @@ if __name__ == "__main__":
         print(f"{'MÉTRICA':<12} | {'TREINO':<10} | {'VALIDAÇÃO':<10}")
         print("-" * 40)
         
-        # PRINT DOS RESULTADOS
-        # Ordena para garantir que Loss e IoU apareçam primeiro
         for k in sorted(train_results.keys()):
-            if "std" in k: continue  # Pula o STD pois ele é impresso junto com o AVG
+            if "std" in k: continue
             
             if "avg" in k:
                 std_k = k.replace("avg", "std")
