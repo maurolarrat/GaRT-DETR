@@ -12,13 +12,13 @@ from SuperiorDETR import SuperiorDETR
 # ============================================================
 # CONFIGURAÇÕES
 # ============================================================
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
 NUM_EPOCHS = 300
 ROOT_DIR = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT"
 LEARNING_RATE = 1e-4
 
+# No seu script de treino, ajuste assim:
 transform = {
     "visible": transforms.Compose([
         transforms.ToTensor(), # Converte para 0-1
@@ -26,12 +26,12 @@ transform = {
     ]),
     "infrared": transforms.Compose([
         transforms.ToTensor(), # Converte para 0-1
-        transforms.Normalize([0.449], [0.226]) # Escala para o canal térmico
+        transforms.Normalize([0.449], [0.226]) # Escala para o canal térmico EfficientNet-B0 1 canal
     ])
 }
 
 # ============================================================
-# UTILITÁRIOS DE COORDENADAS (Respeitando seu esboço)
+# UTILITÁRIOS DE COORDENADAS 
 # ============================================================
 
 def box_cxcywh_to_xyxy(x):
@@ -53,6 +53,10 @@ def calculate_iou(boxes1, boxes2):
     area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
     union = area1 + area2 - inter + 1e-6
     return inter / union
+
+# ============================================================
+# CRITÉRIO COM MATCHER DINÂMICO
+# ============================================================
 
 def generalized_box_iou(boxes1, boxes2):
     """
@@ -78,16 +82,11 @@ def generalized_box_iou(boxes1, boxes2):
 
     return iou - (area_c - union) / area_c
 
-# ============================================================
-# CRITÉRIO COM MATCHER DINÂMICO
-# ============================================================
-
 class MultimodalCriterion(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
     def forward(self, outputs, batch, exist_weight=1.0):
-        # 1. Recuperar Predições
         p_vis = outputs["pred_boxes_vis"] 
         p_ir  = outputs["pred_boxes_ir"] 
         B, T, N, _ = p_vis.shape
@@ -95,8 +94,6 @@ class MultimodalCriterion(torch.nn.Module):
         p_vis_xyxy = box_cxcywh_to_xyxy(p_vis)
         p_ir_xyxy  = box_cxcywh_to_xyxy(p_ir)
         
-        # O Matcher ainda usa a média simples para encontrar a melhor query 
-        # (estabilidade de convergência), mas a métrica final será ponderada.
         p_mean_xyxy = (p_vis_xyxy + p_ir_xyxy) / 2.0
 
         pred_ev, pred_ei, pred_eg = outputs["exist_vis"], outputs["exist_ir"], outputs["exist"]
@@ -108,6 +105,10 @@ class MultimodalCriterion(torch.nn.Module):
         exist_vis = batch["exist_vis"].to(device)
         exist_ir = batch["exist_ir"].to(device)
 
+        # Acesso os frames diretamente do dicionário batch 
+        vis_frames_batch = batch["vis_frames"] # Lista de B sequências
+        ir_frames_batch = batch["ir_frames"]   # Lista de B sequências
+
         metrics = {
             "loss": torch.tensor(0.0, device=device),
             "iou_vis": [], "msa_vis": [],
@@ -116,6 +117,13 @@ class MultimodalCriterion(torch.nn.Module):
         }
 
         for b in range(B):
+            # DETECÇÃO DE MODALIDADE ATIVA
+            # Se o sensor foi zerado (Ablação/Dropout), o frame é uma constante.
+            # O desvio padrão (std) de uma imagem constante é 0.
+            # Uso o primeiro frame [0] da sequência para checar.
+            vis_is_active = vis_frames_batch[b][0].std() > 1e-4
+            ir_is_active  = ir_frames_batch[b][0].std() > 1e-4
+
             w_v_img, h_v_img = float(orig_sizes_vis[b][0]), float(orig_sizes_vis[b][1])
             w_i_img, h_i_img = float(orig_sizes_ir[b][0]), float(orig_sizes_ir[b][1])
             scale_v = torch.tensor([w_v_img, h_v_img, w_v_img, h_v_img], device=device)
@@ -130,20 +138,29 @@ class MultimodalCriterion(torch.nn.Module):
             valid_mask = mask_v | mask_i 
 
             if valid_mask.any():
-                v_preds_mean = p_mean_xyxy[b][valid_mask]
-                M = v_preds_mean.size(0)
+                # MATCHING DINÂMICO
+                # Defini o que o Matcher vai usar como referência baseada no que está ativo
+                if vis_is_active and ir_is_active:
+                    v_preds_match = (p_vis_xyxy[b][valid_mask] + p_ir_xyxy[b][valid_mask]) / 2.0
+                elif ir_is_active:
+                    v_preds_match = p_ir_xyxy[b][valid_mask] # No IR_ONLY, olha só pro IR
+                else:
+                    v_preds_match = p_vis_xyxy[b][valid_mask] # No VISIBLE_ONLY, olha só pro VIS
+                
+                M = v_preds_match.size(0)
                 target_ref = torch.where(mask_v[valid_mask].unsqueeze(1), gt_v_norm[valid_mask], gt_i_norm[valid_mask])
                 
-                dist = torch.abs(v_preds_mean - target_ref.unsqueeze(1)).sum(-1)
+                # O cálculo da distância agora é justo
+                dist = torch.abs(v_preds_match - target_ref.unsqueeze(1)).sum(-1)
                 best_indices = dist.argmin(dim=-1) 
                 idx_range = torch.arange(M, device=device)
-                
+
+                # Seleção das caixas finais para o Loss e Métricas
                 b_vis_xyxy = p_vis_xyxy[b][valid_mask][idx_range, best_indices]
                 b_ir_xyxy  = p_ir_xyxy[b][valid_mask][idx_range, best_indices]
                 b_vis_raw  = p_vis[b][valid_mask][idx_range, best_indices]
                 b_ir_raw   = p_ir[b][valid_mask][idx_range, best_indices]
 
-                # LOSS CALCULATIONS
                 loss_box_batch = torch.tensor(0.0, device=device)
                 if mask_v[valid_mask].any():
                     mv = mask_v[valid_mask]
@@ -167,7 +184,6 @@ class MultimodalCriterion(torch.nn.Module):
                 metrics["loss"] += (loss_box_batch + exist_weight * (0.33*loss_ce_v + 0.33*loss_ce_i + 0.33*loss_ce_g + 0.1*loss_bg))
                 metrics["count"] += 1
 
-                # MÉTRICAS INDIVIDUAIS
                 with torch.no_grad():
                     if mask_v.any():
                         mv = mask_v[valid_mask]
@@ -180,14 +196,12 @@ class MultimodalCriterion(torch.nn.Module):
                         metrics["iou_ir"].append(iou_i.mean().item())
                         metrics["msa_ir"].append((iou_i > 0.5).float().mean().item())
 
-        # CÁLCULO GLOBAL PONDERADO 
         denom = metrics["count"] + 1e-6
         avg_iou_v = np.mean(metrics["iou_vis"]) if metrics["iou_vis"] else 0.0
         avg_iou_i = np.mean(metrics["iou_ir"]) if metrics["iou_ir"] else 0.0
         avg_msa_v = np.mean(metrics["msa_vis"]) if metrics["msa_vis"] else 0.0
         avg_msa_i = np.mean(metrics["msa_ir"]) if metrics["msa_ir"] else 0.0
 
-        # Normalização dos Gates (Confidence Weighting)
         g_v = outputs.get("gate_vis_avg", torch.tensor(0.5)).item()
         g_i = outputs.get("gate_ir_avg", torch.tensor(0.5)).item()
         sum_gates = g_v + g_i + 1e-6
@@ -216,8 +230,8 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
     epoch_logs = {
         "loss": [], 
         "iou_global": [], "msa_global": [], 
-        "iou_vis_avg": [], "msa_vis_avg": [], 
-        "iou_ir_avg": [], "msa_ir_avg": [],   
+        "iou_vis_avg": [], "msa_vis_avg": [], # Adicionado
+        "iou_ir_avg": [], "msa_ir_avg": [],   # Adicionado
         "gate_vis_avg": [], "gate_ir_avg": [],
         "gate_vis_std": [], "gate_ir_std": [] 
     }
@@ -250,7 +264,7 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
                 val = val.item() if torch.is_tensor(val) else val
                 epoch_logs[g_key].append(val)
         
-        # O Visível é global por imagem
+        # O Visível é global por imagem 
         if "gate_vis_avg" in outputs:
             epoch_logs["gate_vis_std"].append(0.0)
         
@@ -258,6 +272,7 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
         pbar.set_postfix({
             "Loss": f"{np.mean(epoch_logs['loss']):.4f}",
             "IoU": f"{np.mean(epoch_logs['iou_global']):.4f}",
+            
             "G_V": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}±{np.mean(epoch_logs['gate_vis_std']):.2f}" if epoch_logs['gate_vis_avg'] else "N/A",
             "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}±{np.mean(epoch_logs['gate_ir_std']):.2f}"
         })
@@ -267,7 +282,6 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
 # ============================================================
 # SCRIPT DE EXECUÇÃO PRINCIPAL
 # ============================================================
-
 if __name__ == "__main__":
     train_dataset = AntiUAVRGBTDataset(ROOT_DIR, split="train", transform=transform)
     val_dataset = AntiUAVRGBTDataset(ROOT_DIR, split="test", transform=transform)
@@ -283,7 +297,20 @@ if __name__ == "__main__":
 
     model = SuperiorDETR(d_model=256, n_queries=20).to(DEVICE)
     criterion = MultimodalCriterion()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+
+    # -----------------------------------------------------------------------------------------------------
+    # apenas enquanto uso o Kendal nos parãmetros dos gates
+    # Filtro os parâmetros que contêm "learnable_bias" para o grupo dos Gates
+    gate_params = [p for n, p in model.named_parameters() if "learnable_bias" in n]
+    # Filtro os parâmetros que NÃO contêm "learnable_bias" para o grupo base
+    base_params = [p for n, p in model.named_parameters() if "learnable_bias" not in n]
+
+    optimizer = torch.optim.AdamW([
+        {'params': base_params, 'lr': LEARNING_RATE},
+        {'params': gate_params, 'lr': LEARNING_RATE * 10, 'weight_decay': 0.0} # Gates sem decay para não esmagar o aprendizado de Kendall
+    ], weight_decay=1e-4)
+    # -----------------------------------------------------------------------------------------------------
 
     os.makedirs("checkpoints", exist_ok=True)
     RESUME_PATH = "checkpoints/superior_detr_checkpoint.pth"
@@ -327,7 +354,7 @@ if __name__ == "__main__":
         print("-" * 40)
         
         # PRINT DOS RESULTADOS
-        # Ordeno para garantir que Loss e IoU apareçam primeiro
+        # Ordena para garantir que Loss e IoU apareçam primeiro
         for k in sorted(train_results.keys()):
             if "std" in k: continue  # Pula o STD pois ele é impresso junto com o AVG
             
