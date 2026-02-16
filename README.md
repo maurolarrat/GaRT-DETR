@@ -1,80 +1,56 @@
-# Relatório de Treinamento: Fusão de Sensores RGB-IR
+Os detalhes deste trabalho estão descritos no artigo compartilhado no Overleaf.
 
-Este repositório apresenta o progresso do treinamento de um modelo de segmentação/detecção baseado em fusão de dados multi-modais (Visível e Infravermelho). O experimento está configurado para 300 épocas, e este documento analisa o comportamento do modelo até a **Época apresentada nas figuras**.
+# Proposta de Tese para a Qualificação
 
-## Visão Geral das Métricas
+## 1. Título
+**"Rastreamento de Micro-Alvos Multimodais via Transformadores de Atenção Localizada e Fusão Espacial Baseada em Incerteza Aleatória Aprendida"**
 
-### Figura 1: Convergência Global
+## 2. Motivação e Justificativa
+O rastreamento de micro-veículos aéreos não tripulados (**micro-UAVs**) apresenta desafios críticos devido à baixa resolução dos alvos (muitas vezes ocupando menos de 0.5% da imagem), manobras erráticas e condições ambientais adversas como neblina, oclusões e saturação térmica.
 
-![Texto Alternativo](Figures/global_metrics.png)
+A motivação deste trabalho reside na insuficiência de algoritmos de rastreamento de modalidade única (apenas RGB ou apenas IR) em cenários complexos. Justifica-se a necessidade de um sistema robusto que não apenas funda dados multiespectrais, mas que **aprenda a confiabilidade dinâmica** de cada sensor através da incerteza intrínseca, evitando que uma modalidade degradada prejudique a predição final.
 
-Análise da perda total (`Total Loss`) em relação às métricas de desempenho global (`Global IoU` e `Global MSA`).
+## 3. Estado da Arte
+Conforme definido na **Revisão Sistemática de Literatura (RSL)** prévia (referenciar Artigo RSL), o estado da arte em rastreamento RGBT evoluiu de fusões no nível de pixels para arquiteturas baseadas em transformadores (ViT, DETR). No entanto, persistem lacunas em:
 
-### Figura 2: Dinâmica Modal e Gating
+* **Seleção de Características:** A maioria dos modelos utiliza pesos estáticos ou mecanismos de atenção global que ignoram a variância espacial do ruído.
+* **Consistência Temporal:** O uso de filtros geométricos (como Filtro de Kalman) falha sob acelerações extremas e trajetórias não lineares de micro-drones.
 
-![Texto Alternativo](Figures/modal_dynamics_final.png)
+## 4. O Problema Científico (A Tese)
+A tese ataca a degradação da confiabilidade sensorial em ambientes dinâmicos através da modelagem de incerteza aleatória.
 
-Decomposição do desempenho por sensor e a contribuição relativa de cada um no mecanismo de *gating*.
+### Proposição Central:
+> "Diferente de abordagens que utilizam pesos de fusão estáticos, a robustez no rastreamento de micro-UAVs é alcançada via gating atencional condicionado pela incerteza intrínseca (aleatória) de cada sensor. A integração de memória temporal residual e refinamento espacial 'Soft-ROI' permite manter a consistência da identidade do alvo mesmo sob falha catastrófica de um dos sensores."
 
----
+## 5. Hipóteses de Pesquisa
+* **H1 (Fusão por Incerteza):** A parametrização do bias de fusão como um logaritmo de variância aprendida (Incerteza de Kendall) permite uma 'ablação dinâmica' em tempo de execução, superando mecanismos que propagam ruído para o espaço latente multimodal.
+* **H2 (Localização Soft-ROI):** A imposição de um bias Gaussiano decrescente nas *Refinement Layers* mitiga o ruído de fundo (*clutter*) em micro-objetos, forçando a convergência da rede para gradientes locais sem a rigidez matemática do ROI Align tradicional.
 
-## Análise Técnica
+## 6. Objetivos
 
-### 1. Período de Warm-up (Épocas 1-10)
+### Objetivo Geral
+Desenvolver e validar uma arquitetura de rastreamento multimodal baseada em transformadores capaz de operar de forma resiliente em vídeos RGBT de micro-alvos.
 
-Durante as primeiras 10 épocas, o modelo operou em regime de *warm-up* com peso de existência reduzido (0.2).
+### Objetivos Específicos
+1.  Implementar um *backbone* RGBT que utilize **Modality Dropout** para garantir aprendizado ortogonal e robustez a falhas de sensores.
+2.  Criar um mecanismo de **Gating Espacial** (via `SpatialGatedFusionBlock`) para o canal infravermelho, permitindo a filtragem seletiva de ruído térmico.
+3.  Desenvolver uma camada de **Refinamento Iterativo** com atenção ROI-Soft para lidar com a extrema escala reduzida dos alvos.
+4.  Avaliar a eficácia da **Inércia de Queries** na manutenção da consistência temporal frente a manobras erráticas.
 
-* **Comportamento:** Observa-se uma queda acentuada na `Loss` e um crescimento linear consistente no `Global IoU` e `MSA`.
-* **Estabilidade:** O mecanismo de *gating* começou com uma distribuição equilibrada (próxima a 0.5), mas rapidamente começou a aprender a relevância de cada sensor para a tarefa inicial.
+## 7. Metodologia Proposta (Contribuições Arquiteturais)
 
-### 2. Transição de Regime (Época 11)
 
-Na época 11, o peso de existência foi elevado (para 1.0).
 
-* **Impacto:** Houve um salto esperado na métrica de `Loss` (de $4.18$ para $4.29$), mas o modelo absorveu o impacto mantendo a tendência de subida na acurácia global.
+### I. O Paradigma da Fusão Assimétrica
+No modelo proposto, o braço visível utiliza um gate global, enquanto o infravermelho aplica um `SpatialGatedFusionBlock`. Dado que o sensor térmico é frequentemente mais ruidoso, mas semanticamente mais simples, o gate espacial permite que o IR contribua com "manchas de calor" localizadas, enquanto o RGB fornece a estrutura global.
 
-### 3. Dinâmica de Equilíbrio RGB-IR
+### II. Propagação Temporal via Inércia de Queries
+A query do frame $t$ é uma interpolação entre o embedding aprendido e o estado do frame $t-1$, ponderada pela confiança combinada. Isto substitui modelos físicos rígidos por uma **inércia latente no espaço de busca**, garantindo que a memória semântica do drone guie a atenção no frame subsequente.
 
-Uma observação notável ocorre entre as **épocas 18 e 21**. Nota-se um fenômeno de "compensação modal":
+### III. Aprendizado sob Dropout de Modalidade (Indiscriminate Learning)
+O *dataloader* e o *backbone* são projetados para o treinamento indiscriminado: o modelo é exposto a apenas um sensor em 50% das iterações (25% VIS-only, 25% IR-only). Isso força a rede a desenvolver redundância latente, essencial para operação em oclusão total ou ausência de luz.
 
-* **A Queda:** Quando o sensor **IR (Infravermelho)** recebe picos de confiança pelo mecanismo de *gate* (visível no terceiro plot da Figura 2, onde a área vermelha se expande levemente), ocorre uma queda temporária no `IoU Global` e no `IoU Visível`.
-* **A Extração de Informação:** O modelo parece utilizar o sensor IR para buscar informações complementares quando o sensor Visível (RGB) atinge um platô ou apresenta falhas de representação.
-* **Recuperação:** Após esse breve aumento de dependência do IR, o modelo tende a retornar ao favorecimento do sensor RGB. Na Época 22, o `Global IoU` e o `MSA` apresentam sinal de recuperação, sugerindo que o modelo utilizou a informação extraída do IR para refinar sua predição final e restabelecer o equilíbrio, com o RGB voltando a ser o guia principal.
-
-### 4. Status Atual
-[RESULTADOS DA ÉPOCA 57]
-MÉTRICA      | TREINO     | VALIDAÇÃO 
-----------------------------------------
-GATE_IR_AVG  | 0.14 (±0.02)    | 0.13 (±0.01)   
-GATE_VIS_AVG | 0.51 (±0.00)    | 0.51 (±0.00)   
-IOU_GLOBAL   | 0.5539          | 0.5254         
-IOU_IR_AVG   | 0.54 (±0.00)    | 0.51 (±0.00)   
-IOU_VIS_AVG  | 0.56 (±0.00)    | 0.53 (±0.00)   
-LOSS         | 4.1652          | 4.2463         
-MSA_GLOBAL   | 0.6990          | 0.6687         
-MSA_IR_AVG   | 0.67 (±0.00)    | 0.65 (±0.00)   
-MSA_VIS_AVG  | 0.71 (±0.00)    | 0.67 (±0.00)   
-
-[!] Novo recorde de MSA: 0.6687. Peso salvo.
-
-* **Loss de Validação:** $4.2463 (está ponderada, e ainda não normalizada)$
-* **Global IoU (Val):** $0.5254$
-* **MSA Recorde (Val):** $0.6687$ (Época 57)
-* **Distribuição de Gate:** O modelo demonstra uma preferência consolidada pelo sensor Visível ($G_V \approx 0.50$ vs $G_I \approx 0.15$), tratando o IR como um suporte informativo especializado.
+## 8. Resultados Esperados
+A pesquisa propõe o **Superior-DETR**, uma arquitetura *end-to-end*. A contribuição original reside na **Fusão Cruzada por Gating de Incerteza**, permitindo adaptação dinâmica a cenários de neblina ou saturação. Espera-se demonstrar que o desacoplamento das cabeças de predição, aliado ao recurso de "Zoom" de alta resolução (`grid_sample`), minimiza o erro de *drift* em micro-escalas, superando o estado da arte em métricas de sucesso temporal (Reset-Lock).
 
 ---
-
-## Próximos Passos
-
-O treinamento continua em execução. A expectativa é observar se:
-
-1. As métricas de IR continuarão a subir de forma independente, aumentando sua utilidade para o mecanismo de fusão.
-2. A `Loss` de validação continuará em tendência descendente ou se entrará em regime de *overfitting* precoce.
-
----
-
-### O que foi considerado na análise:
-
-* **Citação dos Logs:** Usei os valores exatos de Loss e IoU da Época 11 e em diante para validar a transição.
-* **Fenômeno do IR:** Descrevi o meu insight pessoal sobre o modelo "ir buscar informação no IR" de forma técnica, chamando de "compensação modal" e "refinamento de equilíbrio".
-* **Imparcialidade:** O texto reconhece que o processo ainda está em curso e que as oscilações são normais em sistemas de fusão dinâmica.
