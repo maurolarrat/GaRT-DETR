@@ -99,6 +99,7 @@ def generalized_box_iou(boxes1, boxes2):
 
     return iou - (area_c - union) / area_c
 
+
 class MultimodalCriterion(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -122,7 +123,7 @@ class MultimodalCriterion(torch.nn.Module):
         exist_vis = batch["exist_vis"].to(device)
         exist_ir = batch["exist_ir"].to(device)
 
-        # Acessamos os frames diretamente do dicionário batch 
+        # Acesso os frames diretamente do dicionário batch 
         vis_frames_batch = batch["vis_frames"] # Lista de B sequências
         ir_frames_batch = batch["ir_frames"]   # Lista de B sequências
 
@@ -134,10 +135,10 @@ class MultimodalCriterion(torch.nn.Module):
         }
 
         for b in range(B):
-            # --- DETECÇÃO DE MODALIDADE ATIVA ---
+            # DETECÇÃO DE MODALIDADE ATIVA
             # Se o sensor foi zerado (Ablação/Dropout), o frame é uma constante.
             # O desvio padrão (std) de uma imagem constante é 0.
-            # Usamos o primeiro frame [0] da sequência para checar.
+            # Uso o primeiro frame [0] da sequência para checar.
             vis_is_active = vis_frames_batch[b][0].std() > 1e-4
             ir_is_active  = ir_frames_batch[b][0].std() > 1e-4
 
@@ -247,8 +248,8 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
     epoch_logs = {
         "loss": [], 
         "iou_global": [], "msa_global": [], 
-        "iou_vis_avg": [], "msa_vis_avg": [], 
-        "iou_ir_avg": [], "msa_ir_avg": [],   
+        "iou_vis_avg": [], "msa_vis_avg": [],
+        "iou_ir_avg": [], "msa_ir_avg": [],
         "gate_vis_avg": [], "gate_ir_avg": [],
         "gate_vis_std": [], "gate_ir_std": [] 
     }
@@ -268,27 +269,24 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
                 res["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
                 optimizer.step()
-        
+        # LOG DE MÉTRICAS DO CRITÉRIO (Loss, IoU)
         for k, v in res.items():
             if k in epoch_logs:
                 val = v.item() if torch.is_tensor(v) else v
                 epoch_logs[k].append(val)
 
-        for g_key in ["gate_vis_avg", "gate_ir_avg", "gate_ir_std"]:
+        # LOG DOS GATES (Vindo do forward do modelo)
+        for g_key in ["gate_vis_avg", "gate_ir_avg", "gate_vis_std", "gate_ir_std"]:
             if g_key in outputs:
                 val = outputs[g_key]
                 val = val.item() if torch.is_tensor(val) else val
                 epoch_logs[g_key].append(val)
         
-        if "gate_vis_avg" in outputs:
-            epoch_logs["gate_vis_std"].append(0.0)
-        
         pbar.set_postfix({
-            "IoU_G": f"{np.mean(epoch_logs['iou_global']):.3f}",
-            "MSA_G": f"{np.mean(epoch_logs['msa_global']):.3f}",
-            "IoU_V/I": f"{np.mean(epoch_logs['iou_vis_avg']):.2f}/{np.mean(epoch_logs['iou_ir_avg']):.2f}",
-            "MSA_V/I": f"{np.mean(epoch_logs['msa_vis_avg']):.2f}/{np.mean(epoch_logs['msa_ir_avg']):.2f}",
-            "G_V/I": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}//{np.mean(epoch_logs['gate_ir_avg']):.2f}"
+            "Loss": f"{np.mean(epoch_logs['loss']):.4f}",
+            "IoU": f"{np.mean(epoch_logs['iou_global']):.4f}",
+            "G_V": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}±{np.mean(epoch_logs['gate_vis_std']):.2f}" if epoch_logs['gate_vis_avg'] else "N/A",
+            "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}±{np.mean(epoch_logs['gate_ir_std']):.2f}" if epoch_logs['gate_ir_avg'] else "N/A"
         })
 
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in epoch_logs.items()}
@@ -329,19 +327,19 @@ def run_final_test():
 
     print("\n" + "="*115)
     header = (f"{'MODO':<14} | "
-              f"{'IoU G':<8} | {'IoU V':<8} | {'IoU I':<8} | "
-              f"{'MSA G':<8} | {'MSA V':<8} | {'MSA I':<8} | "
-              f"{'GATE IR':<8}")
+            f"{'IoU G':<8} | {'IoU V':<8} | {'IoU I':<8} | "
+            f"{'MSA G':<8} | {'MSA V':<8} | {'MSA I':<8} | "
+            f"{'G_VIS':<8} | {'G_IR':<8}") 
     print(header)
     print("-" * 115)
-    
+
     for m in modes:
         if m in final_summary:
             r = final_summary[m]
             print(f"{m.upper():<14} | "
-                  f"{r['iou_global']:.4f} | {r['iou_vis_avg']:.4f} | {r['iou_ir_avg']:.4f} | "
-                  f"{r['msa_global']:.4f} | {r['msa_vis_avg']:.4f} | {r['msa_ir_avg']:.4f} | "
-                  f"{r['gate_vis_avg']:.4f} | {r['gate_ir_avg']:.4f}")
+                f"{r['iou_global']:.4f} | {r['iou_vis_avg']:.4f} | {r['iou_ir_avg']:.4f} | "
+                f"{r['msa_global']:.4f} | {r['msa_vis_avg']:.4f} | {r['msa_ir_avg']:.4f} | "
+                f"{r['gate_vis_avg']:.4f} | {r['gate_ir_avg']:.4f}")
     print("="*115)
 
 if __name__ == "__main__":
