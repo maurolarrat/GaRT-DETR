@@ -5,7 +5,9 @@ from torchvision import transforms
 import numpy as np
 import os
 from tqdm import tqdm
+import random
 
+# Importe seus módulos originais aqui
 from dataloader import AntiUAVRGBTDataset, collate_fn_superior
 from SuperiorDETR import SuperiorDETR
 
@@ -14,46 +16,99 @@ from SuperiorDETR import SuperiorDETR
 # ============================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
-NUM_EPOCHS = 300
 ROOT_DIR = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT"
-LEARNING_RATE = 1e-4
+GLOBAL_SEED = 2029
 
 transform = {
     "visible": transforms.Compose([
-        transforms.ToTensor(), # Converte para 0-1
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) # Escala para a ResNet 3 canais
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ]),
     "infrared": transforms.Compose([
-        transforms.ToTensor(), # Converte para 0-1
-        transforms.Normalize([0.449], [0.226]) # Escala para o canal térmico do ImageNet EfficientNet-B0 1 canal
+        transforms.ToTensor(),
+        transforms.Normalize([0.449], [0.226])
     ])
 }
 
 # ============================================================
-# UTILITÁRIOS 
+# 1. WRAPPER COM LÓGICA DE REDUNDÂNCIA (ESPELHAMENTO)
 # ============================================================
-
 class AblationModelWrapper(torch.nn.Module):
     def __init__(self, model, mode="dual"):
         super().__init__()
         self.model = model
         self.mode = mode
+        # Estatísticas para re-normalização
+        self.vis_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(DEVICE)
+        self.vis_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(DEVICE)
+        self.ir_mean = torch.tensor([0.449]).view(1, 1, 1).to(DEVICE)
+        self.ir_std = torch.tensor([0.226]).view(1, 1, 1).to(DEVICE)
 
     def forward(self, vis_frames, ir_frames):
+        # CASO 1: Visível Falhou (IR Only)
         if self.mode == "ir_only":
-            new_vis = []
-            for seq in vis_frames:
-                new_vis.append([torch.zeros_like(frame) for frame in seq])
-            vis_frames = new_vis
-            
-        elif self.mode == "visible_only":
-            new_ir = []
+            new_vis_frames = []
             for seq in ir_frames:
-                new_ir.append([torch.zeros_like(frame) for frame in seq])
-            ir_frames = new_ir
+                new_seq = []
+                for frame in seq:
+                    grad_x = torch.abs(frame[:, :, 1:] - frame[:, :, :-1])
+                    grad_x = F.pad(grad_x, (0, 1, 0, 0))
+                    grad_y = torch.abs(frame[:, 1:, :] - frame[:, :-1, :])
+                    grad_y = F.pad(grad_y, (0, 0, 0, 1))
+                    pseudo_rgb = torch.cat([frame, grad_x, grad_y], dim=0)
+                    new_seq.append(pseudo_rgb)
+                new_vis_frames.append(new_seq)
+            vis_frames = new_vis_frames
+
+        # CASO 2: IR Falhou (Visible Only)
+        elif self.mode == "visible_only":
+            new_ir_frames = []
+            for seq in vis_frames:
+                new_seq = []
+                for frame in seq:
+                    # 1. Desnormalizar para voltar ao range [0, 1]
+                    frame_raw = frame * self.vis_std + self.vis_mean
+                    
+                    # 2. Saliência: Pega o valor máximo entre R, G, B
+                    # Isso destaca o drone melhor que a média se ele tiver cor distinta
+                    thermal_sim, _ = torch.max(frame_raw, dim=0, keepdim=True)
+                    
+                    # 3. Soften: Remove texturas finas do visível (faz o backbone IR gostar mais do dado)
+                    thermal_sim = transforms.functional.gaussian_blur(thermal_sim, [5, 5], sigma=1.0)
+                    
+                    # 4. Ajuste de Contraste: Simula o range dinâmico do sensor térmico
+                    thermal_sim = (thermal_sim - thermal_sim.min()) / (thermal_sim.max() - thermal_sim.min() + 1e-6)
+                    
+                    # 5. Re-normalizar com as estatísticas que o braço IR espera
+                    thermal_sim = (thermal_sim - self.ir_mean) / self.ir_std
+                    
+                    new_seq.append(thermal_sim)
+                new_ir_frames.append(new_seq)
+            ir_frames = new_ir_frames
             
         return self.model(vis_frames, ir_frames)
+
+# ============================================================
+# 2. FUNÇÕES AUXILIARES DE CAIXA
+# ============================================================
+
+def set_seed(seed=42):
+    """Fixa todas as seeds para garantir reprodutibilidade."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # para multi-GPU
     
+    # Configurações determinísticas para o motor do PyTorch/CUDA
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Garante que o DataLoader use seeds consistentes
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    print(f"Seed fixada em: {seed}")
+
 def box_cxcywh_to_xyxy(x):
     cx, cy, w, h = x.unbind(-1)
     return torch.stack([cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h], dim=-1)
@@ -62,8 +117,22 @@ def box_xywh_to_xyxy(x):
     x_tl, y_tl, w, h = x.unbind(-1)
     return torch.stack([x_tl, y_tl, x_tl + w, y_tl + h], dim=-1)
 
+def generalized_box_iou(boxes1, boxes2):
+    lt = torch.max(boxes1[:, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    union = area1 + area2 - inter + 1e-6
+    iou = inter / union
+    lt_c = torch.min(boxes1[:, :2], boxes2[:, :2])
+    rb_c = torch.max(boxes1[:, 2:], boxes2[:, 2:])
+    wh_c = (rb_c - lt_c).clamp(min=0)
+    area_c = wh_c[:, 0] * wh_c[:, 1] + 1e-6
+    return iou - (area_c - union) / area_c
+
 def calculate_iou(boxes1, boxes2):
-    """ boxes1: [N, 4] xyxy, boxes2: [N, 4] xyxy """
     lt = torch.max(boxes1[:, :2], boxes2[:, :2])
     rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
     wh = (rb - lt).clamp(min=0)
@@ -74,32 +143,8 @@ def calculate_iou(boxes1, boxes2):
     return inter / union
 
 # ============================================================
-# CRITÉRIO COM MATCHER DINÂMICO
+# 3. CRITÉRIO QUE CONSIDERA DADOS REPLICADOS
 # ============================================================
-
-def generalized_box_iou(boxes1, boxes2):
-    """
-    Calcula a Generalized IoU entre dois conjuntos de caixas.
-    boxes1, boxes2: [N, 4] no formato XYXY
-    """
-    lt = torch.max(boxes1[:, :2], boxes2[:, :2])
-    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, 0] * wh[:, 1]
-    
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    union = area1 + area2 - inter + 1e-6
-    iou = inter / union
-
-    lt_c = torch.min(boxes1[:, :2], boxes2[:, :2])
-    rb_c = torch.max(boxes1[:, 2:], boxes2[:, 2:])
-    wh_c = (rb_c - lt_c).clamp(min=0)
-    area_c = wh_c[:, 0] * wh_c[:, 1] + 1e-6
-
-    return iou - (area_c - union) / area_c
-
-
 class MultimodalCriterion(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -112,8 +157,6 @@ class MultimodalCriterion(torch.nn.Module):
         p_vis_xyxy = box_cxcywh_to_xyxy(p_vis)
         p_ir_xyxy  = box_cxcywh_to_xyxy(p_ir)
         
-        p_mean_xyxy = (p_vis_xyxy + p_ir_xyxy) / 2.0
-
         pred_ev, pred_ei, pred_eg = outputs["exist_vis"], outputs["exist_ir"], outputs["exist"]
         orig_sizes_vis, orig_sizes_ir = outputs["orig_sizes"] 
 
@@ -123,10 +166,6 @@ class MultimodalCriterion(torch.nn.Module):
         exist_vis = batch["exist_vis"].to(device)
         exist_ir = batch["exist_ir"].to(device)
 
-        # Acesso os frames diretamente do dicionário batch 
-        vis_frames_batch = batch["vis_frames"] # Lista de B sequências
-        ir_frames_batch = batch["ir_frames"]   # Lista de B sequências
-
         metrics = {
             "loss": torch.tensor(0.0, device=device),
             "iou_vis": [], "msa_vis": [],
@@ -135,13 +174,6 @@ class MultimodalCriterion(torch.nn.Module):
         }
 
         for b in range(B):
-            # DETECÇÃO DE MODALIDADE ATIVA
-            # Se o sensor foi zerado (Ablação/Dropout), o frame é uma constante.
-            # O desvio padrão (std) de uma imagem constante é 0.
-            # Uso o primeiro frame [0] da sequência para checar.
-            vis_is_active = vis_frames_batch[b][0].std() > 1e-4
-            ir_is_active  = ir_frames_batch[b][0].std() > 1e-4
-
             w_v_img, h_v_img = float(orig_sizes_vis[b][0]), float(orig_sizes_vis[b][1])
             w_i_img, h_i_img = float(orig_sizes_ir[b][0]), float(orig_sizes_ir[b][1])
             scale_v = torch.tensor([w_v_img, h_v_img, w_v_img, h_v_img], device=device)
@@ -156,30 +188,26 @@ class MultimodalCriterion(torch.nn.Module):
             valid_mask = mask_v | mask_i 
 
             if valid_mask.any():
-                # MATCHING DINÂMICO
-                # Defini o que o Matcher vai usar como referência baseada no que está ativo
-                if vis_is_active and ir_is_active:
-                    v_preds_match = (p_vis_xyxy[b][valid_mask] + p_ir_xyxy[b][valid_mask]) / 2.0
-                elif ir_is_active:
-                    v_preds_match = p_ir_xyxy[b][valid_mask] # No IR_ONLY, olha só pro IR
-                else:
-                    v_preds_match = p_vis_xyxy[b][valid_mask] # No VISIBLE_ONLY, olha só pro VIS
+                # MATCHING DINÂMICO SIMPLIFICADO
+                # Como temos redundância, assumimos que ambos os braços estão ativos
+                # e contribuem para a predição.
+                v_preds_match = (p_vis_xyxy[b][valid_mask] + p_ir_xyxy[b][valid_mask]) / 2.0
                 
                 M = v_preds_match.size(0)
                 target_ref = torch.where(mask_v[valid_mask].unsqueeze(1), gt_v_norm[valid_mask], gt_i_norm[valid_mask])
                 
-                # O cálculo da distância agora é justo
                 dist = torch.abs(v_preds_match - target_ref.unsqueeze(1)).sum(-1)
                 best_indices = dist.argmin(dim=-1) 
                 idx_range = torch.arange(M, device=device)
 
-                # Seleção das caixas finais para o Loss e Métricas
                 b_vis_xyxy = p_vis_xyxy[b][valid_mask][idx_range, best_indices]
                 b_ir_xyxy  = p_ir_xyxy[b][valid_mask][idx_range, best_indices]
                 b_vis_raw  = p_vis[b][valid_mask][idx_range, best_indices]
                 b_ir_raw   = p_ir[b][valid_mask][idx_range, best_indices]
 
                 loss_box_batch = torch.tensor(0.0, device=device)
+                
+                # CÁLCULO DE LOSS (Sempre calcula se houver GT, independente de ablação)
                 if mask_v[valid_mask].any():
                     mv = mask_v[valid_mask]
                     l1_v = F.l1_loss(b_vis_raw[mv], gt_v_cxcywh[valid_mask][mv])
@@ -202,14 +230,22 @@ class MultimodalCriterion(torch.nn.Module):
                 metrics["loss"] += (loss_box_batch + exist_weight * (0.33*loss_ce_v + 0.33*loss_ce_i + 0.33*loss_ce_g + 0.1*loss_bg))
                 metrics["count"] += 1
 
+                # -----------------------------------------------------------
+                # CÁLCULO DE MÉTRICAS (IOU/MSA)
+                # Calculamos IoU sempre que houver GT (mask_v), pois o Wrapper
+                # garantiu que há dados (originais ou replicados) entrando.
+                # -----------------------------------------------------------
                 with torch.no_grad():
                     if mask_v.any():
                         mv = mask_v[valid_mask]
+                        # Calcula IoU mesmo se o dado for do IR espelhado
                         iou_v = calculate_iou(b_vis_xyxy[mv], gt_v_norm[valid_mask][mv])
                         metrics["iou_vis"].append(iou_v.mean().item())
                         metrics["msa_vis"].append((iou_v > 0.5).float().mean().item())
+                        
                     if mask_i.any():
                         mi = mask_i[valid_mask]
+                        # Calcula IoU mesmo se o dado for do VIS espelhado
                         iou_i = calculate_iou(b_ir_xyxy[mi], gt_i_norm[valid_mask][mi])
                         metrics["iou_ir"].append(iou_i.mean().item())
                         metrics["msa_ir"].append((iou_i > 0.5).float().mean().item())
@@ -220,6 +256,7 @@ class MultimodalCriterion(torch.nn.Module):
         avg_msa_v = np.mean(metrics["msa_vis"]) if metrics["msa_vis"] else 0.0
         avg_msa_i = np.mean(metrics["msa_ir"]) if metrics["msa_ir"] else 0.0
 
+        # Pega os gates reais do modelo
         g_v = outputs.get("gate_vis_avg", torch.tensor(0.5)).item()
         g_i = outputs.get("gate_ir_avg", torch.tensor(0.5)).item()
         sum_gates = g_v + g_i + 1e-6
@@ -227,6 +264,7 @@ class MultimodalCriterion(torch.nn.Module):
         w_v = g_v / sum_gates
         w_i = g_i / sum_gates
 
+        # O Global considera a performance do sensor enganado
         return {
             "loss": metrics["loss"] / denom,
             "iou_global": (w_v * avg_iou_v) + (w_i * avg_iou_i),
@@ -236,11 +274,10 @@ class MultimodalCriterion(torch.nn.Module):
             "iou_ir_avg": avg_iou_i,
             "msa_ir_avg": avg_msa_i
         }
-    
+
 # ============================================================
 # FUNÇÃO DE EXECUÇÃO DE ÉPOCA
 # ============================================================
-
 def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_weight=1.0):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -251,11 +288,9 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
         "iou_vis_avg": [], "msa_vis_avg": [],
         "iou_ir_avg": [], "msa_ir_avg": [],
         "gate_vis_avg": [], "gate_ir_avg": [],
-        "gate_vis_std": [], "gate_ir_std": [] 
     }
 
-    desc = ">> TREINO" if is_train else ">> VALIDAÇÃO"
-    pbar = tqdm(loader, desc=desc)
+    pbar = tqdm(loader, desc=">> TESTE")
     
     for batch in pbar:
         vis, ir = batch["vis_frames"], batch["ir_frames"]
@@ -264,41 +299,42 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
             outputs = model(vis, ir)
             res = criterion(outputs, batch, exist_weight=exist_weight)
 
-            if is_train:
-                optimizer.zero_grad()
-                res["loss"].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-                optimizer.step()
-        # LOG DE MÉTRICAS DO CRITÉRIO (Loss, IoU)
         for k, v in res.items():
             if k in epoch_logs:
                 val = v.item() if torch.is_tensor(v) else v
                 epoch_logs[k].append(val)
 
-        # LOG DOS GATES (Vindo do forward do modelo)
-        for g_key in ["gate_vis_avg", "gate_ir_avg", "gate_vis_std", "gate_ir_std"]:
+        # Log dos Gates reais
+        for g_key in ["gate_vis_avg", "gate_ir_avg"]:
             if g_key in outputs:
-                val = outputs[g_key]
-                val = val.item() if torch.is_tensor(val) else val
+                val = outputs[g_key].item() if torch.is_tensor(outputs[g_key]) else outputs[g_key]
                 epoch_logs[g_key].append(val)
         
         pbar.set_postfix({
-            "Loss": f"{np.mean(epoch_logs['loss']):.4f}",
             "IoU": f"{np.mean(epoch_logs['iou_global']):.4f}",
-            "G_V": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}±{np.mean(epoch_logs['gate_vis_std']):.2f}" if epoch_logs['gate_vis_avg'] else "N/A",
-            "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}±{np.mean(epoch_logs['gate_ir_std']):.2f}" if epoch_logs['gate_ir_avg'] else "N/A"
+            "G_V": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}",
+            "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}"
         })
 
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in epoch_logs.items()}
 
 # ============================================================
-# 3. FUNÇÕES DE TESTE
+# FUNÇÃO PRINCIPAL DE TESTE
 # ============================================================
-def perform_test_suite(mode="dual"):
+def perform_test_suite(mode="dual",seed=GLOBAL_SEED):
     print(f"\n>>> INICIANDO TESTE: Modo {mode.upper()}")
     
+    # Criar um gerador para o DataLoader ser determinístico
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     test_dataset = AntiUAVRGBTDataset(ROOT_DIR, split="test", transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn_superior)
+    test_loader = DataLoader(test_dataset, 
+                             batch_size=8, 
+                             shuffle=False, 
+                             collate_fn=collate_fn_superior,
+                             worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id),
+                            generator=g)
 
     model = SuperiorDETR(d_model=256, n_queries=20).to(DEVICE)
     BEST_MODEL_PATH = "checkpoints/superior_detr_best.pth"
@@ -309,11 +345,12 @@ def perform_test_suite(mode="dual"):
         print(f"Erro: Checkpoint não achado.")
         return None
 
+    # Aqui usamos o Wrapper que faz o espelhamento
     model_wrapped = AblationModelWrapper(model, mode=mode)
     
     results = run_epoch(
         model_wrapped, test_loader, MultimodalCriterion(), 
-        optimizer=None, device=DEVICE, exist_weight=1.0
+        optimizer=None, device=DEVICE
     )
     return results
 
@@ -343,4 +380,5 @@ def run_final_test():
     print("="*115)
 
 if __name__ == "__main__":
+    set_seed(GLOBAL_SEED)
     run_final_test()
