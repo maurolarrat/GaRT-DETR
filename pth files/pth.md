@@ -21,7 +21,7 @@ Link para download: https://drive.google.com/file/d/1laDVIEULgIa0FXeGq3DGFwmXb1S
 
 ---
 
-### Table II: Comparative mSA (%) performance against State-of-the-Art trackers on the Anti-UAV dataset.
+### Table II: Comparative mSA (%) performance against State-of-the-Art trackers on the Anti-UAV300 Test Set.
 
 | Tracker | mSA (IR) | mSA (VIS) |
 | :--- | :---: | :---: |
@@ -32,7 +32,7 @@ Link para download: https://drive.google.com/file/d/1laDVIEULgIa0FXeGq3DGFwmXb1S
 
 ---
 
-### Table III: Performance Under Single-Modality Constraints (Ablation Study)
+### Table III: Performance Under Single-Modality Constraints (Ablation Study) on the Anti-UAV300 Test Set.
 
 | Metric | Visible Only | IR Only |
 | :--- | :---: | :---: |
