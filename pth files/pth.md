@@ -3,7 +3,11 @@ Arquivos gerados após o treino e validação do modelo.
 Antes de usar estes arquivos, certifique-se de renomeá-los para o nome usado nos scripts.
 
 ### Model with the best global and individual multimodal results, and with inferior results when faced with the absence of one of the modalities
-Link para download: https://drive.google.com/file/d/1laDVIEULgIa0FXeGq3DGFwmXb1SumitP/view?usp=drive_link
+Link para download do arquivo pth: https://drive.google.com/file/d/1laDVIEULgIa0FXeGq3DGFwmXb1SumitP/view?usp=drive_link
+
+Link para download do log de treino e validação: https://drive.google.com/file/d/1Ljz_ND2wPKRUH8bTFBoj7sEHumLw7MwG/view?usp=drive_link
+
+Link para download do log de teste: https://drive.google.com/file/d/1fR_9FA99f9D7EvHVbwU1m8nK-Kc8At6L/view?usp=drive_link
 
 ### Table I: Final Performance Evaluation on Anti-UAV300 Test Set
 
