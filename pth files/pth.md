@@ -1,7 +1,3 @@
-Arquivos gerados após o treino e validação do modelo.
-
-Antes de usar estes arquivos, certifique-se de renomeá-los para o nome usado nos scripts.
-
 ### Model with the best global and individual multimodal results, and with inferior results when faced with the absence of one of the modalities
 Link para download do arquivo pth: https://drive.google.com/file/d/1laDVIEULgIa0FXeGq3DGFwmXb1SumitP/view?usp=drive_link
 
