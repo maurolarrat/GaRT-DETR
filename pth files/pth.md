@@ -21,13 +21,14 @@ Link para download: https://drive.google.com/file/d/1laDVIEULgIa0FXeGq3DGFwmXb1S
 
 ---
 
-### Table II: Comparative mSA (%) performance against State-of-the-Art trackers on the Anti-UAV300 Test Set.
+### Table II: Comparative mSA (%) performance against State-of-the-Art trackers on the Anti-UAV300 dataset.
 
 | Tracker | mSA (IR) | mSA (VIS) |
 | :--- | :---: | :---: |
-| SiamRPN++LT | 65.84 | 67.15 |
-| GlobalTrack | 72.00 | 67.28 |
-| SiamRCNN | 74.33 | 74.32 |
+| LTDSE | 56.51 | 64.29 |
+| Super-Dimp | 57.72 | 59.49 |
+| GlobalTrack | 63.86 | 66.24 |
+| SiamRCNN | 65.41 | 70.83 |
 | **SuperiorDETR (Ours)** | **76.46** | **80.37** |
 
 ---
