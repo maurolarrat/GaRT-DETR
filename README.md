@@ -11,7 +11,7 @@ O rastreamento de micro-veículos aéreos não tripulados (**micro-UAVs**) apres
 A motivação deste trabalho reside na insuficiência de algoritmos de rastreamento de modalidade única (apenas RGB ou apenas IR) em cenários complexos. Justifica-se a necessidade de um sistema robusto que não apenas funda dados multiespectrais, mas que **aprenda a confiabilidade dinâmica** de cada sensor através da incerteza intrínseca, evitando que uma modalidade degradada prejudique a predição final.
 
 ## 3. Estado da Arte
-Conforme definido na **Revisão Sistemática de Literatura (RSL)** prévia (referenciar Artigo RSL), o estado da arte em rastreamento RGBT evoluiu de fusões no nível de pixels para arquiteturas baseadas em transformadores (ViT, DETR). No entanto, persistem lacunas em:
+Conforme definido na **Revisão Sistemática de Literatura (RSL)** prévia (referenciar o artigo da RSL que a ACM está há 3375 anos revisando...), o estado da arte em rastreamento RGBT evoluiu de fusões no nível de pixels para arquiteturas baseadas em transformadores (ViT, DETR). No entanto, persistem lacunas em:
 
 * **Seleção de Características:** A maioria dos modelos utiliza pesos estáticos ou mecanismos de atenção global que ignoram a variância espacial do ruído.
 * **Consistência Temporal:** O uso de filtros geométricos (como Filtro de Kalman) falha sob acelerações extremas e trajetórias não lineares de micro-drones.
