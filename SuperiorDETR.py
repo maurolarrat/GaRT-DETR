@@ -56,31 +56,30 @@ class SpatialGatedFusionBlock(nn.Module):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
         self.temperature = temperature
-        # Gate atua por TOKEN (1x1 conv ou Linear por token)
         self.spatial_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.ReLU(),
             nn.Linear(d_model // 4, 1)
         )
+        # Técnica de Kendall: Parâmetro treinado automaticamente pelo otimizador
+        # O bias controlado
+        self.learnable_bias = nn.Parameter(torch.tensor([10.0]))
+        # Zera o bias aleatório do PyTorch. evita o valor acima + um valor aleatoriodo pytorch
         nn.init.constant_(self.spatial_gate[-1].bias, 0.0)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, f_main, f_aux):
-        # f_aux: [B, Tokens, d_model]
-        # Calcula confiança para cada região da imagem IR
         spatial_logits = self.spatial_gate(f_aux) 
-        conf = torch.sigmoid(spatial_logits / self.temperature) # [B, Tokens, 1]
+        # Aplicamos o bias aprendido antes do sigmoid
+        conf = torch.sigmoid((spatial_logits + self.learnable_bias) / self.temperature) 
         
         f_fused, _ = self.cross_attn(f_main, f_aux, f_aux)
 
-        # Calcula a média e o desvio padrão real entre os tokens (espacial)
-        s_mean = conf.mean(dim=1) # Média por imagem no batch
-        s_std  = conf.std(dim=1)  # Desvio padrão real por imagem no batch
-        # -------------------
+        s_mean = conf.mean(dim=1) 
+        s_std  = conf.std(dim=1) 
         
-        # O IR (f_aux) entra no RGB (f_main) filtrado espacialmente
         return self.norm(f_main + conf * f_fused), (s_mean, s_std)
-    
+
 class GatedFusionBlock(nn.Module):
     def __init__(self, d_model, nhead):
         super().__init__()
@@ -88,20 +87,22 @@ class GatedFusionBlock(nn.Module):
         self.gate = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.ReLU(),
-            nn.Linear(d_model // 4, 1) # Saída linear para ser usada com Sigmoid
+            nn.Linear(d_model // 4, 1)
         )
-        # gate para começar em 0.5 (neutro)
-        nn.init.constant_(self.gate[-1].bias, 0.0) 
+        # Técnica de Kendall: Substituí o bias fixo por um parâmetro treinável
+        self.learnable_bias = nn.Parameter(torch.tensor([5.0]))
+        # Zera o bias aleatório do PyTorch. evita o valor acima + um valor aleatoriodo pyt
+        nn.init.constant_(self.gate[-1].bias, 0.0)
+
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, f_main, f_aux):
-        # Confiança aprendida puramente pelos dados, sem clamps artificiais
-        conf = torch.sigmoid(self.gate(f_aux.mean(dim=1))).unsqueeze(1) 
+        data_logits = self.gate(f_aux.mean(dim=1)).unsqueeze(1)
+        # A confiança agora é a soma do que os dados dizem + o ajuste aprendido
+        conf = torch.sigmoid(data_logits + self.learnable_bias)
         
         f_fused, _ = self.cross_attn(f_main, f_aux, f_aux)
         
-        # f_main recebe a informação de f_aux pesada pela confiança
-        # Tratamento igualitário: o modelo decide o escalar conf [0, 1]
         return self.norm(f_main + conf * f_fused), conf
 
 # ============================================================
@@ -136,7 +137,6 @@ class RGBTBackbone(nn.Module):
             out_indices=(1, 3) 
         )
         # Agora adaptamos cirurgicamente a primeira camada para 1 canal
-        # Isso remove o erro de "Unexpected keys" e mantém o aprendizado
         old_conv = self.ir_net.conv_stem
         new_conv = nn.Conv2d(1, old_conv.out_channels, 
                              kernel_size=old_conv.kernel_size, 
@@ -144,7 +144,7 @@ class RGBTBackbone(nn.Module):
                              padding=old_conv.padding, bias=False)
         
         with torch.no_grad():
-            # Fazemos a média dos pesos dos 3 canais RGB para o canal único IR
+            # média dos pesos dos 3 canais RGB para o canal único IR
             new_conv.weight[:] = old_conv.weight.sum(dim=1, keepdim=True)
         self.ir_net.conv_stem = new_conv
         # PROJEÇÕES DE CANAL PARA d_model
@@ -165,7 +165,7 @@ class RGBTBackbone(nn.Module):
         self.proj_high_res = nn.Conv2d(64 + 24, d_model, 1) 
         # BLOCOS DE FUSÃO CRUZADA COM GATING
         # RGB recebe informação do IR ponderada por um gate aprendido
-        self.rgb_enhanced_by_ir = GatedFusionBlock(d_model, nhead)
+        self.rgb_enhanced_by_ir = SpatialGatedFusionBlock(d_model, nhead)
         # IR recebe informação do RGB ponderada por outro gate independente
         self.ir_enhanced_by_rgb = SpatialGatedFusionBlock(d_model, nhead)
         # Bottleneck final:
@@ -186,6 +186,20 @@ class RGBTBackbone(nn.Module):
         f_ir_low = ir_features[0] 
         # Feature IR profunda (1/16, 112 canais)
         f_ir_deep = ir_features[1] 
+        # ============================================================
+        # INSERÇÃO DO MODALITY DROPOUT (RGB)
+        # ============================================================
+        # Se estiver em treino, há uma chance (%) de "apagar" uma ou outra modalidade.
+        if self.training:
+            p = torch.rand(1).item()
+            if p < 0.25: # 25% das vezes SÓ TÉRMICO (Zera RGB)
+                f_rgb_low = torch.zeros_like(f_rgb_low)
+                f_rgb_deep = torch.zeros_like(f_rgb_deep)
+            elif p < 0.50: # Próximos 25% (de 0.25 a 0.50) SÓ VISÍVEL (Zera IR)
+                f_ir_low = torch.zeros_like(f_ir_low)
+                f_ir_deep = torch.zeros_like(f_ir_deep)
+            # Os 50% restantes (de 0.50 a 1.0) permanecem Multimodal (Ambos ativos)
+        # ============================================================
         # ============================================================
         # TESTE DE SANIDADE: APAGAR RGB (Temporário) - passou!
         # Ao zerar esses dois tensores, o modelo não recebe NADA do Visível.
@@ -210,7 +224,7 @@ class RGBTBackbone(nn.Module):
         f_ir  = self.proj_ir(f_ir_deep).flatten(2).permute(0, 2, 1)
         # FUSÃO CRUZADA COM GATING
         # RGB recebe contexto do IR, ponderado por confiança aprendida
-        f_rgb_fused, conf_ir = self.rgb_enhanced_by_ir(f_rgb, f_ir)
+        f_rgb_fused, (conf_ir_m, conf_ir_s)   = self.rgb_enhanced_by_ir(f_rgb, f_ir)
         # IR recebe contexto do RGB, ponderado por outra confiança
         # Agora capturamos a tupla (média, std) vinda do SpatialGatedFusionBlock
         f_ir_fused, (conf_rgb_m, conf_rgb_s) = self.ir_enhanced_by_rgb(f_ir, f_rgb)
@@ -222,7 +236,7 @@ class RGBTBackbone(nn.Module):
         # - fused: memória multimodal pronta para o Transformer
         # - confs: scores médios de gate (úteis para diagnóstico)
         # - f_high_res: feature espacial para refinamento posterior
-        return fused, (conf_rgb_m, conf_ir, conf_rgb_s), f_high_res
+        return fused, (conf_rgb_m, conf_ir_m, conf_rgb_s, conf_ir_s), f_high_res
 
 # ============================================================
 # 2. REFINEMENT LAYER (MELHORIA 3: SOFT ROI-ATTENTION)
@@ -341,7 +355,7 @@ class SuperiorDETR(nn.Module):
         # Processa a memória no Encoder e remodela para separar Batch e Tempo
         memory_all, gates_info, high_res_feat = self.backbone(x_rgb, x_ir)
         # Remodela features de alta resolução para uso no mecanismo de zoom (grid_sample)
-        conf_rgb_m, conf_ir, conf_rgb_s = gates_info 
+        conf_rgb_m, conf_ir_m, conf_rgb_s, conf_ir_s = gates_info
         # Inicializa listas para armazenar predições de toda a sequência
         memory_all = self.encoder(memory_all).view(B, T, -1, self.d_model)
         # Remodela features de alta resolução para uso no mecanismo de zoom (grid_sample)
@@ -422,8 +436,9 @@ class SuperiorDETR(nn.Module):
             "exist":      torch.stack(all_eg, dim=1),
             "gate_scores": gates_info,        
             "gate_vis_avg": conf_rgb_m.mean(), # Usando os valores desempacotados
-            "gate_ir_avg":  conf_ir.mean(),    # Usando os valores desempacotados
-            "gate_ir_std":  conf_rgb_s.mean(), # A NOVA CHAVE para o log do desvio padrão
+            "gate_ir_avg":  conf_ir_m.mean(),  # Agora usa conf_ir_m
+            "gate_vis_std": conf_rgb_s.mean(), # Opcional: log do desvio do RGB
+            "gate_ir_std":  conf_ir_s.mean(),  # Agora temos o std do IR também
             "orig_sizes": (o_vis, o_ir)
         }
 
