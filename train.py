@@ -14,7 +14,7 @@ from SuperiorDETR import SuperiorDETR
 # ============================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
-NUM_EPOCHS = 300
+NUM_EPOCHS = 400
 ROOT_DIR = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT"
 LEARNING_RATE = 1e-4
 
