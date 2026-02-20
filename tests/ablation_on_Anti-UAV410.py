@@ -16,7 +16,7 @@ from SuperiorDETR import SuperiorDETR
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
 ROOT_DIR_410 = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT\Anti-UAV410"
-GLOBAL_SEED = 2029
+NUM_RUNS = 100  # Definido para 100 execuções
 
 transform = {
     "visible": transforms.Compose([
@@ -99,7 +99,7 @@ def generalized_box_iou(boxes1, boxes2):
     return iou - (area_c - union) / area_c
 
 # ============================================================
-# 3. CRITÉRIO (L1 + GIoU focado no IR)
+# 3. CRITÉRIO AJUSTADO (L1 + GIoU focado no IR)
 # ============================================================
 class MultimodalCriterion(torch.nn.Module):
     def __init__(self):
@@ -121,31 +121,25 @@ class MultimodalCriterion(torch.nn.Module):
             w_i, h_i = float(orig_sizes_ir[b][0]), float(orig_sizes_ir[b][1])
             scale_i = torch.tensor([w_i, h_i, w_i, h_i], device=device)
             
-            # Normalização do Ground Truth
             gt_i_norm_xyxy = box_xywh_to_xyxy(gt_ir[b]) / scale_i
             gt_i_norm_cxcywh = gt_ir[b] / scale_i
             
             mask_i = exist_ir[b] > 0
 
             if mask_i.any():
-                # MATCHING EXCLUSIVO NO BRAÇO IR
                 dist = torch.abs(p_ir_xyxy[b][mask_i] - gt_i_norm_xyxy[mask_i].unsqueeze(1)).sum(-1)
                 best_indices = dist.argmin(dim=-1)
                 idx_range = torch.arange(mask_i.sum(), device=device)
                 
-                # Seleção das melhores predições
                 b_ir_xyxy = p_ir_xyxy[b][mask_i][idx_range, best_indices]
                 b_ir_raw  = p_ir_raw[b][mask_i][idx_range, best_indices]
 
-                # CÁLCULO DA LOSS (L1 + GIoU)
                 loss_l1 = F.l1_loss(b_ir_raw, gt_i_norm_cxcywh[mask_i])
                 loss_giou = (1.0 - torch.diag(generalized_box_iou(b_ir_xyxy, gt_i_norm_xyxy[mask_i]))).mean()
                 
-                # Pesos padrão do DETR: 5 para L1 e 2 para GIoU
                 metrics["loss"] += (5.0 * loss_l1 + 2.0 * loss_giou)
                 metrics["count"] += 1
 
-                # MÉTRICAS DE SUCESSO 
                 iou_i = calculate_iou(b_ir_xyxy, gt_i_norm_xyxy[mask_i])
                 metrics["iou_ir"].append(iou_i.mean().item())
                 metrics["msa_ir"].append((iou_i > 0.5).float().mean().item())
@@ -160,10 +154,10 @@ class MultimodalCriterion(torch.nn.Module):
 # ============================================================
 # 4. EXECUÇÃO
 # ============================================================
-def run_epoch(model, loader, criterion):
+def run_epoch(model, loader, criterion, run_idx=0):
     model.eval()
     logs = {"loss": [], "iou_ir_avg": [], "msa_ir_avg": []}
-    pbar = tqdm(loader, desc=">> TESTE 410 (IR-MATCH + L1)")
+    pbar = tqdm(loader, desc=f">> RUN {run_idx+1}/{NUM_RUNS}", leave=False)
     
     for batch in pbar:
         vis, ir = batch["vis_frames"], batch["ir_frames"]
@@ -175,38 +169,51 @@ def run_epoch(model, loader, criterion):
             val = res[k].item() if torch.is_tensor(res[k]) else res[k]
             logs[k].append(val)
             
-        pbar.set_postfix({"Loss": f"{np.mean(logs['loss']):.4f}", "IoU_IR": f"{np.mean(logs['iou_ir_avg']):.4f}"})
+        pbar.set_postfix({"Loss": f"{np.mean(logs['loss']):.4f}", "IoU": f"{np.mean(logs['iou_ir_avg']):.4f}"})
     return {k: np.mean(v) for k, v in logs.items()}
 
 def run_final_test_410():
     print("\n" + "="*60)
-    print("      SUPERIORDETR - ABLATION 410 (IR-MATCHING + L1 LOSS)")
+    print(f"   SUPERIORDETR - 410 EVALUATION (AVERAGE OVER {NUM_RUNS} RUNS)")
     print("="*60)
 
-    set_seed(GLOBAL_SEED)
+    # Dataset e Loader (carregados uma vez para eficiência)
     test_dataset = AntiUAV410Dataset(ROOT_DIR_410, split="test", transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_superior)
-
-    model = SuperiorDETR(d_model=256, n_queries=20).to(DEVICE)
+    
     BEST_MODEL_PATH = "checkpoints/superior_detr_best.pth"
-
-    if os.path.exists(BEST_MODEL_PATH):
-        model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE, weights_only=True), strict=False)
-    else:
-        print("[!] Erro: Checkpoint não encontrado.")
+    if not os.path.exists(BEST_MODEL_PATH):
+        print(f"[!] Erro: Checkpoint {BEST_MODEL_PATH} não encontrado.")
         return
 
-    model_wrapped = AblationModelWrapper(model, mode="ir_only")
-    criterion = MultimodalCriterion()
+    # Lista para armazenar resultados de cada run
+    all_runs_results = []
 
-    results = run_epoch(model_wrapped, test_loader, criterion)
+    for i in range(NUM_RUNS):
+        # Gera uma semente aleatória para esta execução
+        current_seed = random.randint(1, 100000)
+        set_seed(current_seed)
+
+        # Inicializa Modelo e Critério para cada run (para garantir independência da semente)
+        model = SuperiorDETR(d_model=256, n_queries=20).to(DEVICE)
+        model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE, weights_only=True), strict=False)
+        
+        model_wrapped = AblationModelWrapper(model, mode="ir_only")
+        criterion = MultimodalCriterion()
+
+        # Executa o teste
+        res = run_epoch(model_wrapped, test_loader, criterion, run_idx=i)
+        all_runs_results.append(res)
+
+    # Cálculo das médias finais
+    final_avg = {k: np.mean([r[k] for r in all_runs_results]) for k in all_runs_results[0].keys()}
 
     print("\n" + "-"*45)
-    print(f" {'MÉTRICA':<20} | {'VALOR':<10}")
+    print(f" {'MÉTRICA (MÉDIA 100 RUNS)':<25} | {'VALOR':<10}")
     print("-" * 45)
-    print(f" {'Loss (L1+GIoU)':<20} | {results['loss']:.4f}")
-    print(f" {'IoU (Thermal)':<20} | {results['iou_ir_avg']:.4f}")
-    print(f" {'MSA (Thermal)':<20} | {results['msa_ir_avg']:.4f}")
+    print(f" {'Loss (L1+GIoU)':<25} | {final_avg['loss']:.4f}")
+    print(f" {'IoU (Thermal)':<25} | {final_avg['iou_ir_avg']:.4f}")
+    print(f" {'MSA (Thermal)':<25} | {final_avg['msa_ir_avg']:.4f}")
     print("-" * 45)
     print("=" * 60)
 
