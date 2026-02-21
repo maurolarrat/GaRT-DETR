@@ -7,7 +7,6 @@ import os
 from tqdm import tqdm
 import random
 
-# Importe seus módulos originais aqui
 from dataloader import AntiUAVRGBTDataset, collate_fn_superior
 from SuperiorDETR import SuperiorDETR
 
@@ -17,7 +16,8 @@ from SuperiorDETR import SuperiorDETR
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
 ROOT_DIR = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT"
-GLOBAL_SEED = 2029
+NUM_RUNS=50
+GLOBAL_SEED=2029
 
 transform = {
     "visible": transforms.Compose([
@@ -93,21 +93,14 @@ class AblationModelWrapper(torch.nn.Module):
 # ============================================================
 
 def set_seed(seed=42):
-    """Fixa todas as seeds para garantir reprodutibilidade."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) # para multi-GPU
-    
-    # Configurações determinísticas para o motor do PyTorch/CUDA
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    # Garante que o DataLoader use seeds consistentes
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    print(f"Seed fixada em: {seed}")
 
 def box_cxcywh_to_xyxy(x):
     cx, cy, w, h = x.unbind(-1)
@@ -189,7 +182,7 @@ class MultimodalCriterion(torch.nn.Module):
 
             if valid_mask.any():
                 # MATCHING DINÂMICO SIMPLIFICADO
-                # Como temos redundância, assumimos que ambos os braços estão ativos
+                # Com a redundância, assume-se que ambos os braços estão ativos
                 # e contribuem para a predição.
                 v_preds_match = (p_vis_xyxy[b][valid_mask] + p_ir_xyxy[b][valid_mask]) / 2.0
                 
@@ -232,7 +225,7 @@ class MultimodalCriterion(torch.nn.Module):
 
                 # -----------------------------------------------------------
                 # CÁLCULO DE MÉTRICAS (IOU/MSA)
-                # Calculamos IoU sempre que houver GT (mask_v), pois o Wrapper
+                # Calcula IoU sempre que houver GT (mask_v), pois o Wrapper
                 # garantiu que há dados (originais ou replicados) entrando.
                 # -----------------------------------------------------------
                 with torch.no_grad():
@@ -264,7 +257,7 @@ class MultimodalCriterion(torch.nn.Module):
         w_v = g_v / sum_gates
         w_i = g_i / sum_gates
 
-        # O Global considera a performance do sensor enganado
+        # O Global considera a performance do sensor espelhado
         return {
             "loss": metrics["loss"] / denom,
             "iou_global": (w_v * avg_iou_v) + (w_i * avg_iou_i),
@@ -276,9 +269,9 @@ class MultimodalCriterion(torch.nn.Module):
         }
 
 # ============================================================
-# FUNÇÃO DE EXECUÇÃO DE ÉPOCA
+# FUNÇÃO DE EXECUÇÃO DE ÉPOCA (REVISADA PARA MULTI-RUN)
 # ============================================================
-def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_weight=1.0):
+def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_weight=1.0, current_run=1):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
     
@@ -290,7 +283,8 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
         "gate_vis_avg": [], "gate_ir_avg": [],
     }
 
-    pbar = tqdm(loader, desc=">> TESTE")
+    # Barra de progresso indica qual run executando
+    pbar = tqdm(loader, desc=f">> RUN {current_run}/{NUM_RUNS}", leave=False)
     
     for batch in pbar:
         vis, ir = batch["vis_frames"], batch["ir_frames"]
@@ -299,32 +293,27 @@ def run_epoch(model, loader, criterion, optimizer=None, device=DEVICE, exist_wei
             outputs = model(vis, ir)
             res = criterion(outputs, batch, exist_weight=exist_weight)
 
+        # Captura métricas do critério
         for k, v in res.items():
             if k in epoch_logs:
                 val = v.item() if torch.is_tensor(v) else v
                 epoch_logs[k].append(val)
 
-        # Log dos Gates reais
+        # Captura os Gates (G_VIS e G_IR)
         for g_key in ["gate_vis_avg", "gate_ir_avg"]:
             if g_key in outputs:
                 val = outputs[g_key].item() if torch.is_tensor(outputs[g_key]) else outputs[g_key]
                 epoch_logs[g_key].append(val)
         
-        pbar.set_postfix({
-            "IoU": f"{np.mean(epoch_logs['iou_global']):.4f}",
-            "G_V": f"{np.mean(epoch_logs['gate_vis_avg']):.2f}",
-            "G_I": f"{np.mean(epoch_logs['gate_ir_avg']):.2f}"
-        })
+        pbar.set_postfix({"IoU": f"{np.mean(epoch_logs['iou_global']):.4f}"})
 
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in epoch_logs.items()}
 
 # ============================================================
-# FUNÇÃO PRINCIPAL DE TESTE
+# FUNÇÃO DE SUÍTE DE TESTE (INDIVIDUAL POR RUN)
 # ============================================================
-def perform_test_suite(mode="dual",seed=GLOBAL_SEED):
-    print(f"\n>>> INICIANDO TESTE: Modo {mode.upper()}")
-    
-    # Criar um gerador para o DataLoader ser determinístico
+def perform_test_suite(mode="dual", seed=42, current_run=1):
+    set_seed(seed)
     g = torch.Generator()
     g.manual_seed(seed)
 
@@ -334,7 +323,7 @@ def perform_test_suite(mode="dual",seed=GLOBAL_SEED):
                              shuffle=False, 
                              collate_fn=collate_fn_superior,
                              worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id),
-                            generator=g)
+                             generator=g)
 
     model = SuperiorDETR(d_model=256, n_queries=20).to(DEVICE)
     BEST_MODEL_PATH = "checkpoints/superior_detr_best.pth"
@@ -342,43 +331,72 @@ def perform_test_suite(mode="dual",seed=GLOBAL_SEED):
     if os.path.exists(BEST_MODEL_PATH):
         model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE, weights_only=True), strict=False)    
     else:
-        print(f"Erro: Checkpoint não achado.")
+        print(f"Erro: Checkpoint não encontrado.")
         return None
 
-    # Aqui usamos o Wrapper que faz o espelhamento
     model_wrapped = AblationModelWrapper(model, mode=mode)
     
-    results = run_epoch(
-        model_wrapped, test_loader, MultimodalCriterion(), 
-        optimizer=None, device=DEVICE
-    )
+    # current_run para o log de progresso
+    results = run_epoch(model_wrapped, test_loader, MultimodalCriterion(), current_run=current_run)
     return results
 
+# ============================================================
+# FUNÇÃO FINAL (TABELA COMPLETA COM MÉDIA ± STD)
+# ============================================================
 def run_final_test():
     modes = ["dual", "ir_only", "visible_only"]
-    final_summary = {}
+    summary_stats = {}
 
     for mode in modes:
-        res = perform_test_suite(mode)
-        if res: final_summary[mode] = res
+        print(f"\n>>> INICIANDO AVALIAÇÃO ESTOCÁSTICA ({NUM_RUNS} RUNS): Modo {mode.upper()}")
+        mode_results = []
+        
+        for i in range(NUM_RUNS):
+            # Gera uma semente aleatória para cada uma das 100 runs
+            random_seed = random.randint(1, 1000000)
+            res = perform_test_suite(mode, seed=random_seed, current_run=i+1)
+            if res:
+                mode_results.append(res)
+        
+        if mode_results:
+            keys = mode_results[0].keys()
+            summary_stats[mode] = {
+                "mean": {k: np.mean([r[k] for r in mode_results]) for k in keys},
+                "std":  {k: np.std([r[k] for r in mode_results]) for k in keys}
+            }
 
-    print("\n" + "="*115)
+    # Restaurando exatamente as suas colunas, agora com suporte a Média ± σ
+    line_width = 195
+    print("\n" + "="*line_width)
+    print(f"RESUMO FINAL: MÉDIA ± DESVIO PADRÃO (σ) DE {NUM_RUNS} EXECUÇÕES")
+    print("="*line_width)
+    
+    # Header formatado para alinhar com os dados largos
     header = (f"{'MODO':<14} | "
-            f"{'IoU G':<8} | {'IoU V':<8} | {'IoU I':<8} | "
-            f"{'MSA G':<8} | {'MSA V':<8} | {'MSA I':<8} | "
-            f"{'G_VIS':<8} | {'G_IR':<8}") 
+              f"{'IoU G (±σ)':<18} | {'IoU V (±σ)':<18} | {'IoU I (±σ)':<18} | "
+              f"{'MSA G (±σ)':<18} | {'MSA V (±σ)':<18} | {'MSA I (±σ)':<18} | "
+              f"{'G_VIS (±σ)':<16} | {'G_IR (±σ)':<16}")
     print(header)
-    print("-" * 115)
+    print("-" * line_width)
 
     for m in modes:
-        if m in final_summary:
-            r = final_summary[m]
+        if m in summary_stats:
+            avg = summary_stats[m]["mean"]
+            std = summary_stats[m]["std"]
+            
+            # Helper para formatar a célula Média ± Std
+            def f_cell(val_key, precision=4):
+                m_val = avg[val_key]
+                s_val = std[val_key]
+                return f"{m_val:.{precision}f}±{s_val:.{precision}f}"
+
             print(f"{m.upper():<14} | "
-                f"{r['iou_global']:.4f} | {r['iou_vis_avg']:.4f} | {r['iou_ir_avg']:.4f} | "
-                f"{r['msa_global']:.4f} | {r['msa_vis_avg']:.4f} | {r['msa_ir_avg']:.4f} | "
-                f"{r['gate_vis_avg']:.4f} | {r['gate_ir_avg']:.4f}")
-    print("="*115)
+                  f"{f_cell('iou_global'):<18} | {f_cell('iou_vis_avg'):<18} | {f_cell('iou_ir_avg'):<18} | "
+                  f"{f_cell('msa_global'):<18} | {f_cell('msa_vis_avg'):<18} | {f_cell('msa_ir_avg'):<18} | "
+                  f"{f_cell('gate_vis_avg', 3):<16} | {f_cell('gate_ir_avg', 3):<16}")
+    print("="*line_width)
 
 if __name__ == "__main__":
-    set_seed(GLOBAL_SEED)
+    # Semente mestre para que o sorteio das 100 sub-sementes seja repetível
+    random.seed(GLOBAL_SEED)
     run_final_test()
