@@ -80,31 +80,6 @@ class SpatialGatedFusionBlock(nn.Module):
         
         return self.norm(f_main + conf * f_fused), (s_mean, s_std)
 
-class GatedFusionBlock(nn.Module):
-    def __init__(self, d_model, nhead):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.gate = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
-            nn.ReLU(),
-            nn.Linear(d_model // 4, 1)
-        )
-        # Técnica de Kendall: Substituí o bias fixo por um parâmetro treinável
-        self.learnable_bias = nn.Parameter(torch.tensor([5.0]))
-        # Zera o bias aleatório do PyTorch. evita o valor acima + um valor aleatoriodo pyt
-        nn.init.constant_(self.gate[-1].bias, 0.0)
-
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, f_main, f_aux):
-        data_logits = self.gate(f_aux.mean(dim=1)).unsqueeze(1)
-        # A confiança agora é a soma do que os dados dizem + o ajuste aprendido
-        conf = torch.sigmoid(data_logits + self.learnable_bias)
-        
-        f_fused, _ = self.cross_attn(f_main, f_aux, f_aux)
-        
-        return self.norm(f_main + conf * f_fused), conf
-
 # ============================================================
 # 1. BACKBONE RGBT
 # ============================================================
