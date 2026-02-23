@@ -53,10 +53,6 @@ def calculate_iou(boxes1, boxes2):
     union = area1 + area2 - inter + 1e-6
     return inter / union
 
-# ============================================================
-# CRITÉRIO COM MATCHER DINÂMICO
-# ============================================================
-
 def generalized_box_iou(boxes1, boxes2):
     """
     Calcula a Generalized IoU entre dois conjuntos de caixas.
@@ -78,6 +74,10 @@ def generalized_box_iou(boxes1, boxes2):
     area_c = wh_c[:, 0] * wh_c[:, 1] + 1e-6
 
     return iou - (area_c - union) / area_c
+    
+# ============================================================
+# CRITÉRIO COM MATCHER DINÂMICO
+# ============================================================
 
 class MultimodalCriterion(torch.nn.Module):
     def __init__(self):
