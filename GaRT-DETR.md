@@ -1,6 +1,6 @@
-# Documentação Técnica: Modelo SuperiorDETR (RGBT Tracking)
+# Documentação Técnica: Modelo GaRT-DETR (RGBT Tracking)
 
-Este documento descreve a arquitetura e o fluxo de dados do modelo **SuperiorDETR**, um detector/rastreador multimodal que combina informações de sensores Visíveis (RGB) e Infravermelhos (IR) utilizando mecanismos de atenção espacial e refinamento iterativo.
+Este documento descreve a arquitetura e o fluxo de dados do modelo **GaRT-DETR**, um detector/rastreador multimodal que combina informações de sensores Visíveis (RGB) e Infravermelhos (IR) utilizando mecanismos de atenção espacial e refinamento iterativo.
 
 ## 1. Pré-processamento Temporal (`preprocess_batch`)
 
@@ -41,7 +41,7 @@ Este bloco implementa a **Soft ROI-Attention**, uma das principais inovações d
 * **Atenção Gaussiana:** Em vez de olhar para a imagem toda, a atenção é multiplicada por um "bias" que força o modelo a olhar apenas ao redor da posição atual da query.
 * **Foco Progressivo:** À medida que passamos pelas camadas (0 a 6), o raio de visão (Sigma) diminui, forçando o modelo a ser cada vez mais preciso.
 
-## 5. Arquitetura Central (`SuperiorDETR`)
+## 5. Arquitetura Central (`GaRT-DETR`)
 
 A classe mestre que orquestra o fluxo temporal e iterativo:
 
