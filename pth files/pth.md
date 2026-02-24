@@ -1,4 +1,4 @@
-### Model with the best global and individual multimodal results
+### GaRT-DETR v1:
 
 Link para download do arquivo pth: https://drive.google.com/file/d/1cVfKCbWy9ANSqrmpIgYn92v6P4jtlvZ8/view?usp=drive_link
 
