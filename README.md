@@ -17,14 +17,16 @@ Conforme definido na **Revisão Sistemática de Literatura (RSL)** prévia (refe
 * **Consistência Temporal:** O uso de filtros geométricos (como Filtro de Kalman) falha sob acelerações extremas e trajetórias não lineares de micro-drones.
 
 ## 4. O Problema Científico (A Tese)
-A tese ataca a degradação da confiabilidade sensorial em ambientes dinâmicos através da modelagem de incerteza aleatória.
+A tese investiga o problema da degradação da confiabilidade sensorial em ambientes dinâmicos e adversos, onde diferentes modalidades apresentam falhas intermitentes, ruído dependente do contexto e desempenho assimétrico ao longo do tempo. Em cenários de rastreamento de micro-UAVs, essa degradação pode levar à dominância indevida de uma modalidade sobre as demais, resultando em colapso da predição ou perda da identidade do alvo.
+
+Diferentemente de abordagens baseadas em pesos de fusão estáticos ou heurísticos, esta tese propõe que a robustez no rastreamento multimodal deve emergir da aprendizagem dinâmica da confiabilidade relativa de cada sensor, condicionada diretamente ao conteúdo das representações internas do modelo.
 
 ### Proposição Central:
 > "Diferente de abordagens que utilizam pesos de fusão estáticos, a robustez no rastreamento de micro-UAVs é alcançada via gating atencional condicionado pela incerteza intrínseca (aleatória) de cada sensor. A integração de memória temporal residual e refinamento espacial 'Soft-ROI' permite manter a consistência da identidade do alvo mesmo sob falha catastrófica de um dos sensores."
 
 ## 5. Hipóteses de Pesquisa
-* **H1 (Fusão por Incerteza):** A parametrização do bias de fusão como um logaritmo de variância aprendida (Incerteza de Kendall) permite uma 'ablação dinâmica' em tempo de execução, superando mecanismos que propagam ruído para o espaço latente multimodal.
-* **H2 (Localização Soft-ROI):** A imposição de um bias Gaussiano decrescente nas *Refinement Layers* mitiga o ruído de fundo (*clutter*) em micro-objetos, forçando a convergência da rede para gradientes locais sem a rigidez matemática do ROI Align tradicional.
+* **H1 (Fusão por Confiança Aprendida):**  A parametrização de um mecanismo de gating atencional com bias aprendível permite a supressão dinâmica de modalidades degradadas em tempo de execução, evitando que informações ruidosas ou inconsistentes se propaguem para o espaço latente multimodal e comprometam a predição final.
+* **H2 (Localização Soft-ROI):** A imposição de um bias Gaussiano progressivamente decrescente nas Refinement Layers reduz o impacto de ruído de fundo (clutter) no rastreamento de micro-objetos, promovendo a convergência da rede para gradientes locais relevantes sem a rigidez matemática imposta por operações de recorte espacial rígido, como o ROI (Region of Interest) Align tradicional.
 
 ## 6. Objetivos
 
