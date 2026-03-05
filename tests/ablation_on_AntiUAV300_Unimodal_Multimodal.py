@@ -16,7 +16,7 @@ from SuperiorDETR import SuperiorDETR
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
 ROOT_DIR = r"C:\Users\Micro\Documents\sourcecode\Anti-UAV-RGBT"
-NUM_RUNS=50
+NUM_RUNS=100
 GLOBAL_SEED=2029
 
 transform = {
@@ -139,8 +139,9 @@ def calculate_iou(boxes1, boxes2):
 # 3. CRITÉRIO QUE CONSIDERA DADOS REPLICADOS
 # ============================================================
 class MultimodalCriterion(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, mode="dual"):
         super().__init__()
+        self.mode = mode
 
     def forward(self, outputs, batch, exist_weight=1.0):
         p_vis = outputs["pred_boxes_vis"] 
@@ -200,19 +201,47 @@ class MultimodalCriterion(torch.nn.Module):
 
                 loss_box_batch = torch.tensor(0.0, device=device)
                 
-                # CÁLCULO DE LOSS (Sempre calcula se houver GT, independente de ablação)
-                if mask_v[valid_mask].any():
-                    mv = mask_v[valid_mask]
-                    l1_v = F.l1_loss(b_vis_raw[mv], gt_v_cxcywh[valid_mask][mv])
-                    giou_v = (1.0 - torch.diag(generalized_box_iou(b_vis_xyxy[mv], gt_v_norm[valid_mask][mv]))).mean()
-                    loss_box_batch += (5.0 * l1_v + 2.0 * giou_v)
-                
-                if mask_i[valid_mask].any():
-                    mi = mask_i[valid_mask]
-                    l1_i = F.l1_loss(b_ir_raw[mi], gt_i_cxcywh[valid_mask][mi])
-                    giou_i = (1.0 - torch.diag(generalized_box_iou(b_ir_xyxy[mi], gt_i_norm[valid_mask][mi]))).mean()
-                    loss_box_batch += (5.0 * l1_i + 2.0 * giou_i)
+                # CÁLCULO DE LOSS
+                # LOSS DE CAIXA: apenas braço REAL contribui quando o outro é sintético
+                ####################################################################################
+                if self.mode == "dual":
+                    if mask_v[valid_mask].any():
+                        mv = mask_v[valid_mask]
+                        loss_box_batch += (
+                            5.0 * F.l1_loss(b_vis_raw[mv], gt_v_cxcywh[valid_mask][mv]) +
+                            2.0 * (1.0 - torch.diag(generalized_box_iou(
+                                b_vis_xyxy[mv], gt_v_norm[valid_mask][mv]
+                            ))).mean()
+                        )
+                    if mask_i[valid_mask].any():
+                        mi = mask_i[valid_mask]
+                        loss_box_batch += (
+                            5.0 * F.l1_loss(b_ir_raw[mi], gt_i_cxcywh[valid_mask][mi]) +
+                            2.0 * (1.0 - torch.diag(generalized_box_iou(
+                                b_ir_xyxy[mi], gt_i_norm[valid_mask][mi]
+                            ))).mean()
+                        )
 
+                elif self.mode == "ir_only":
+                    if mask_i[valid_mask].any():
+                        mi = mask_i[valid_mask]
+                        loss_box_batch += (
+                            5.0 * F.l1_loss(b_ir_raw[mi], gt_i_cxcywh[valid_mask][mi]) +
+                            2.0 * (1.0 - torch.diag(generalized_box_iou(
+                                b_ir_xyxy[mi], gt_i_norm[valid_mask][mi]
+                            ))).mean()
+                        )
+
+                elif self.mode == "visible_only":
+                    if mask_v[valid_mask].any():
+                        mv = mask_v[valid_mask]
+                        loss_box_batch += (
+                            5.0 * F.l1_loss(b_vis_raw[mv], gt_v_cxcywh[valid_mask][mv]) +
+                            2.0 * (1.0 - torch.diag(generalized_box_iou(
+                                b_vis_xyxy[mv], gt_v_norm[valid_mask][mv]
+                            ))).mean()
+                        )
+                ##################################################################################
                 target_exist = torch.zeros((M, N), device=device)
                 target_exist[idx_range, best_indices] = 1.0
                 loss_ce_v = F.binary_cross_entropy_with_logits(pred_ev[b][valid_mask], target_exist)
@@ -225,20 +254,18 @@ class MultimodalCriterion(torch.nn.Module):
 
                 # -----------------------------------------------------------
                 # CÁLCULO DE MÉTRICAS (IOU/MSA)
-                # Calcula IoU sempre que houver GT (mask_v), pois o Wrapper
-                # garantiu que há dados (originais ou replicados) entrando.
                 # -----------------------------------------------------------
                 with torch.no_grad():
-                    if mask_v.any():
+                    # Só loga IoU Visível se o sensor Visível for REAL (Modo Dual ou Visible_Only)
+                    if mask_v.any() and self.mode in ["dual", "visible_only"]:
                         mv = mask_v[valid_mask]
-                        # Calcula IoU mesmo se o dado for do IR espelhado
                         iou_v = calculate_iou(b_vis_xyxy[mv], gt_v_norm[valid_mask][mv])
                         metrics["iou_vis"].append(iou_v.mean().item())
                         metrics["msa_vis"].append((iou_v > 0.5).float().mean().item())
-                        
-                    if mask_i.any():
+                    
+                    # Só loga IoU IR se o sensor IR for REAL (Modo Dual ou IR_Only)
+                    if mask_i.any() and self.mode in ["dual", "ir_only"]:
                         mi = mask_i[valid_mask]
-                        # Calcula IoU mesmo se o dado for do VIS espelhado
                         iou_i = calculate_iou(b_ir_xyxy[mi], gt_i_norm[valid_mask][mi])
                         metrics["iou_ir"].append(iou_i.mean().item())
                         metrics["msa_ir"].append((iou_i > 0.5).float().mean().item())
@@ -252,16 +279,28 @@ class MultimodalCriterion(torch.nn.Module):
         # Pega os gates reais do modelo
         g_v = outputs.get("gate_vis_avg", torch.tensor(0.5)).item()
         g_i = outputs.get("gate_ir_avg", torch.tensor(0.5)).item()
-        sum_gates = g_v + g_i + 1e-6
         
-        w_v = g_v / sum_gates
-        w_i = g_i / sum_gates
+        # LÓGICA DE GLOBAL RIGOROSA:
+        if self.mode == "ir_only":
+            # O Global deve ser 100% o que veio do sensor real IR
+            iou_global = avg_iou_i
+            msa_global = avg_msa_i
+        elif self.mode == "visible_only":
+            # O Global deve ser 100% o que veio do sensor real Visível
+            iou_global = avg_iou_v
+            msa_global = avg_msa_v
+        else: # "dual"
+            # No modo dual, usamos a ponderação dos gates para ver a fusão real
+            sum_gates = g_v + g_i + 1e-6
+            w_v = g_v / sum_gates
+            w_i = g_i / sum_gates
+            iou_global = (w_v * avg_iou_v) + (w_i * avg_iou_i)
+            msa_global = (w_v * avg_msa_v) + (w_i * avg_msa_i)
 
-        # O Global considera a performance do sensor espelhado
         return {
             "loss": metrics["loss"] / denom,
-            "iou_global": (w_v * avg_iou_v) + (w_i * avg_iou_i),
-            "msa_global": (w_v * avg_msa_v) + (w_i * avg_msa_i),
+            "iou_global": iou_global,
+            "msa_global": msa_global,
             "iou_vis_avg": avg_iou_v,
             "msa_vis_avg": avg_msa_v,
             "iou_ir_avg": avg_iou_i,
@@ -337,7 +376,12 @@ def perform_test_suite(mode="dual", seed=42, current_run=1):
     model_wrapped = AblationModelWrapper(model, mode=mode)
     
     # current_run para o log de progresso
-    results = run_epoch(model_wrapped, test_loader, MultimodalCriterion(), current_run=current_run)
+    results = run_epoch(
+        model_wrapped,
+        test_loader,
+        MultimodalCriterion(mode=mode),
+        current_run=current_run
+    )
     return results
 
 # ============================================================
@@ -365,7 +409,6 @@ def run_final_test():
                 "std":  {k: np.std([r[k] for r in mode_results]) for k in keys}
             }
 
-    # Restaurando exatamente as suas colunas, agora com suporte a Média ± σ
     line_width = 195
     print("\n" + "="*line_width)
     print(f"RESUMO FINAL: MÉDIA ± DESVIO PADRÃO (σ) DE {NUM_RUNS} EXECUÇÕES")
