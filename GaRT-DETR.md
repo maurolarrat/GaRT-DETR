@@ -1,84 +1,84 @@
-# Documentação Técnica: Modelo GaRT-DETR (RGBT Tracking)
+# Technical Documentation: GaRT-DETR Model (RGBT Tracking)
 
-Este documento descreve a arquitetura e o fluxo de dados do modelo **GaRT-DETR**, um detector/rastreador multimodal que combina informações de sensores Visíveis (RGB) e Infravermelhos (IR) utilizando mecanismos de atenção espacial e refinamento iterativo.
+This document describes the architecture and data flow of the **GaRT-DETR** model, a multimodal detector/tracker that combines information from Visible (RGB) and Infrared (IR) sensors using spatial attention mechanisms and iterative refinement.
 
-## 1. Pré-processamento Temporal (`preprocess_batch`)
+## 1. Temporal Preprocessing (`preprocess_batch`)
 
-O pipeline começa com o tratamento dos dados de entrada. Como o modelo lida com vídeos (sequências), esta função organiza o "caos" dimensional:
+The pipeline begins with input data handling. Since the model operates on videos (sequences), this function organizes the dimensional complexity:
 
-* **Flatten Temporal:** Concatena todos os frames de todas as sequências do batch em um único tensor gigante () para processamento eficiente no backbone.
-* **Redimensionamento:** Garante que ambos os sensores (RGB e IR) estejam na mesma resolução alvo (ex: 224x224).
-* **Preservação de Metadados:** Armazena os tamanhos originais das imagens para que, no final, as caixas delimitadoras possam ser convertidas de volta para os pixels reais do vídeo original.
+* **Temporal Flattening:** Concatenates all frames from all sequences in the batch into a single large tensor () for efficient backbone processing.
+* **Resizing:** Ensures that both sensors (RGB and IR) share the same target resolution (e.g., 224x224).
+* **Metadata Preservation:** Stores the original image sizes so that, at the end, the bounding boxes can be converted back to the real pixel coordinates of the original video.
 
-## 2. Blocos de Fusão com Gating
+## 2. Fusion Blocks with Gating
 
-O modelo utiliza dois tipos de blocos para fundir as informações dos sensores, decidindo "o quanto" confiar em cada um:
+The model uses two types of blocks to fuse sensor information, determining "how much" to trust each modality:
 
-### `GatedFusionBlock` (Fusão Global)
+### `GatedFusionBlock` (Global Fusion)
 
-* **Mecânica:** Usa Atenção Cruzada (*Cross-Attention*) para que o braço principal consulte o braço auxiliar.
-* **Gate de Confiança:** Calcula um valor escalar único para a imagem inteira. Se o IR estiver ruidoso, o gate fecha, diminuindo a influência do IR no RGB.
+* **Mechanism:** Uses Cross-Attention so that the primary branch can query the auxiliary branch.
+* **Confidence Gate:** Computes a single scalar value for the entire image. If the IR signal is noisy, the gate closes, reducing the influence of IR on RGB.
 
-### `SpatialGatedFusionBlock` (Fusão Espacial)
+### `SpatialGatedFusionBlock` (Spatial Fusion)
 
-* **Mecânica:** Diferente do anterior, este calcula a confiança **por região** (token).
-* **Foco:** Se houver fumaça em apenas uma parte do frame RGB, o modelo pode escolher confiar no IR apenas naquela região específica, mantendo o RGB para o restante da imagem.
+* **Mechanism:** Unlike the previous block, this one computes confidence **per region** (token).
+* **Focus:** If smoke is present in only one part of the RGB frame, the model may choose to trust the IR modality only in that specific region while preserving RGB information for the remainder of the image.
 
-## 3. O Backbone Multimodal (`RGBTBackbone`)
+## 3. The Multimodal Backbone (`RGBTBackbone`)
 
-Este é o extrator de características de "dois braços":
+This is the dual-branch feature extractor:
 
-* **Braço RGB (ResNet18):** Especialista em capturar texturas, cores e bordas finas.
-* **Braço IR (EfficientNet-B0):** Adaptado cirurgicamente para aceitar 1 canal (térmico). Ele foca em assinaturas de calor e formas que persistem em baixa luminosidade.
-* **Extração Multinível:** O backbone extrai tanto *features* profundas (para semântica) quanto de alta resolução (para localização precisa).
-* **Memória Multimodal:** O resultado final é uma representação fundida que serve como a "memória visual" para o Transformer.
+* **RGB Branch (ResNet18):** Specialized in capturing textures, colors, and fine edges.
+* **IR Branch (EfficientNet-B0):** Surgically adapted to accept a single thermal channel. It focuses on heat signatures and shapes that remain detectable under low-light conditions.
+* **Multi-Level Extraction:** The backbone extracts both deep features (for semantics) and high-resolution features (for precise localization).
+* **Multimodal Memory:** The final output is a fused representation that serves as the "visual memory" for the Transformer.
 
-## 4. Camada de Refinamento (`RefinementLayer`)
+## 4. Refinement Layer (`RefinementLayer`)
 
-Este bloco implementa a **Soft ROI-Attention**, uma das principais inovações do código:
+This block implements **Soft ROI-Attention**, one of the main innovations of the codebase:
 
-* **Auto-Atenção:** As queries (propostas de drones) conversam entre si para evitar detecções duplicadas.
-* **Atenção Gaussiana:** Em vez de olhar para a imagem toda, a atenção é multiplicada por um "bias" que força o modelo a olhar apenas ao redor da posição atual da query.
-* **Foco Progressivo:** À medida que passamos pelas camadas (0 a 6), o raio de visão (Sigma) diminui, forçando o modelo a ser cada vez mais preciso.
+* **Self-Attention:** Queries (drone proposals) interact with each other to avoid duplicate detections.
+* **Gaussian Attention:** Instead of attending to the entire image, attention is multiplied by a bias that forces the model to focus only around the current query position.
+* **Progressive Focus:** As the layers progress (0 to 6), the viewing radius (Sigma) decreases, forcing the model to become increasingly precise.
 
-## 5. Arquitetura Central (`GaRT-DETR`)
+## 5. Core Architecture (`GaRT-DETR`)
 
-A classe mestre que orquestra o fluxo temporal e iterativo:
+The master class that orchestrates the temporal and iterative flow:
 
-### Inicialização de Queries
+### Query Initialization
 
-* O modelo não começa do zero. Ele inicializa um **Grid Proporcional** de pontos de referência distribuídos pela imagem, garantindo que nenhuma região seja ignorada no início.
+* The model does not start from scratch. It initializes a **Proportional Grid** of reference points distributed across the image, ensuring that no region is ignored at the beginning.
 
-### Propagação Temporal (Smooth Tracking)
+### Temporal Propagation (Smooth Tracking)
 
-* **Mecanismo de Alpha-Blending:** O modelo usa a confiança do frame anterior para guiar o atual. Se o drone foi detectado com firmeza no frame `t-1`, a query no frame `t` começará exatamente naquela posição, criando um rastreio fluido e estável.
+* **Alpha-Blending Mechanism:** The model uses confidence from the previous frame to guide the current one. If the drone was confidently detected at frame `t-1`, the query at frame `t` will start exactly from that position, creating smooth and stable tracking.
 
-### Mecanismo de Zoom (High-Res Zoom)
+### Zoom Mechanism (High-Res Zoom)
 
-* No meio do processo de refinamento (camada 2), o modelo faz uma pausa para olhar os detalhes.
-* **`_make_sampling_grid`:** Gera coordenadas para "recortar" um patch de alta resolução de onde o objeto parece estar.
-* **ROI Align Manual:** Usando `grid_sample`, ele extrai detalhes finos que o backbone profundo perdeu, reintegrando essa informação na query.
+* During the middle of the refinement process (layer 2), the model pauses to inspect details.
+* **`_make_sampling_grid`:** Generates coordinates to "crop" a high-resolution patch from where the object is likely located.
+* **Manual ROI Align:** Using `grid_sample`, the model extracts fine details that the deep backbone lost, reintegrating this information into the query.
 
-### Predição Desacoplada
+### Decoupled Prediction
 
-* O modelo gera duas caixas: uma para o Visível e outra para o IR. Isso permite lidar com o efeito de **Paralaxe** (quando os sensores estão em posições físicas diferentes) ou quando o drone está visível em um sensor, mas ocluso em outro.
+* The model generates two bounding boxes: one for the Visible modality and another for the IR modality. This enables handling of the **Parallax** effect (when sensors are physically displaced) or situations where the drone is visible in one modality but occluded in the other.
 
-## 6. Motor de Amostragem (`_make_sampling_grid`)
+## 6. Sampling Engine (`_make_sampling_grid`)
 
-Uma função utilitária geométrica que:
+A geometric utility function that:
 
-1. Pega as coordenadas `[0, 1]` da caixa.
-2. Converte para o espaço de coordenadas do PyTorch `[-1, 1]`.
-3. Aplica uma escala de **1.5x** para garantir que o recorte tenha um pouco de contexto ao redor do objeto.
-4. Cria a malha de amostragem necessária para a função `F.grid_sample`.
+1. Takes the bounding box coordinates in `[0, 1]`.
+2. Converts them to the PyTorch coordinate space `[-1, 1]`.
+3. Applies a **1.5x** scaling factor to ensure that the crop contains contextual information around the object.
+4. Creates the sampling grid required for the `F.grid_sample` function.
 
 ---
 
-### Resumo do Fluxo de Dados
+### Data Flow Summary
 
-1. **Entrada:** Batch de sequências RGBT.
-2. **Backbone:** Fusão inteligente de sensores com gates de confiança.
-3. **Transformer Encoder:** Refinamento global da memória.
-4. **Loop Temporal:** Queries são propagadas de frame em frame com suavização.
-5. **Refinamento Iterativo:** Queries buscam o drone na memória usando atenção focada e zoom local.
-6. **Saída:** Coordenadas e scores de existência para ambos os sensores.
+1. **Input:** Batch of RGBT sequences.
+2. **Backbone:** Intelligent sensor fusion with confidence gates.
+3. **Transformer Encoder:** Global refinement of the memory representation.
+4. **Temporal Loop:** Queries are propagated frame-by-frame with smoothing.
+5. **Iterative Refinement:** Queries search for the drone within memory using focused attention and local zoom.
+6. **Output:** Coordinates and existence scores for both sensor modalities.
