@@ -15,4 +15,6 @@ https://drive.google.com/file/d/1VFPVOA_eQHwnpJsMioErRIMbwIZYiba-/view?usp=shari
 
 ---
 
-If you have IR ONLY, synchronized with a drone, in the style of the Anti-UAV410 or Anti-UAV600, use this script to generate the detection boxes in both IR and PSEUDO-RGB, or only IR in both .
+If you have IR ONLY video, synchronized with a drone, in the style of the Anti-UAV410 or Anti-UAV600, use this script to generate the detection boxes in IR video (The IR video will be mirrored in both branches of the model).
+
+https://drive.google.com/file/d/1rs5D06tXjRPGu9PeoKS42cMwWiOR7uK0/view?usp=sharing
